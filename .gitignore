@@ -1,0 +1,22 @@
+# Build directory
+build/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Vendor specific (vendor/whisper.cpp added via git submodule)
+vendor/whisper.cpp/
+
+# OS files
+.DS_Store
+
+# Model files (large binary files)
+models/*
+!models/.gitkeep
+
+# Test audio
+test_speech.wav
