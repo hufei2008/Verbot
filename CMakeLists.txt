@@ -11,6 +11,7 @@ endif()
 
 # macOS 需要 AudioToolbox 框架（AudioUnit 音频播放）
 find_library(AUDIO_TOOLBOX AudioToolbox REQUIRED)
+find_library(AUDIO_UNIT AudioUnit REQUIRED)
 
 # ════════════════════════════════════════
 # 1. llama.cpp — 大语言模型推理引擎
@@ -73,6 +74,7 @@ target_link_libraries(asr_demo PRIVATE
     whisper
     llama
     ${AUDIO_TOOLBOX}
+    ${AUDIO_UNIT}
     ${COSYVOICE_PYTHON_PREFIX}/lib/libpython3.10.dylib
 )
 

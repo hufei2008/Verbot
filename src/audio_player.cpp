@@ -158,8 +158,19 @@ void AudioPlayer::play(const std::vector<int16_t>& data) {
     play(data.data(), data.size());
 }
 
+void AudioPlayer::start_stream() {
+    m_streaming = true;
+}
+
+void AudioPlayer::finish_stream() {
+    m_streaming = false;
+    m_cv.notify_all();
+}
+
 void AudioPlayer::fill_buffer(void* buffer_ptr) {
     auto* buffer = static_cast<AudioQueueBufferRef>(buffer_ptr);
+    bool should_enqueue = true;
+    bool should_stop = false;
 
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -167,40 +178,49 @@ void AudioPlayer::fill_buffer(void* buffer_ptr) {
         AudioStreamBasicDescription* asbd = static_cast<AudioStreamBasicDescription*>(m_format);
 
         if (m_playback_buffer.empty()) {
-            // 音频数据全部播完 → 停止 AudioQueue
-            AudioQueueRef queue = static_cast<AudioQueueRef>(m_queue);
-            OSStatus st = AudioQueueStop(queue, false);  // graceful stop
-            if (st == noErr) {
-                m_playing = false;
+            if (m_streaming) {
+                memset(buffer->mAudioData, 0, buffer->mAudioDataBytesCapacity);
+                buffer->mAudioDataByteSize = buffer->mAudioDataBytesCapacity;
+            } else {
+                should_enqueue = false;
+                should_stop = true;
             }
-            // 不要 enqueue 这个 buffer，AudioQueueStop 后不再需要
-            m_cv.notify_all();
-            return;
+        } else {
+            size_t max_frames = buffer->mAudioDataBytesCapacity / asbd->mBytesPerFrame;
+            size_t frames_to_copy = std::min(m_playback_buffer.size(), max_frames);
+
+            // 拷贝实际数据
+            memcpy(buffer->mAudioData, m_playback_buffer.data(), frames_to_copy * sizeof(int16_t));
+            m_total_played += frames_to_copy;
+
+            size_t bytes_filled = frames_to_copy * asbd->mBytesPerFrame;
+            if (bytes_filled < buffer->mAudioDataBytesCapacity) {
+                // 不足一帧时剩余部分填充静音
+                memset(static_cast<char*>(buffer->mAudioData) + bytes_filled,
+                       0,
+                       buffer->mAudioDataBytesCapacity - bytes_filled);
+            }
+            buffer->mAudioDataByteSize = buffer->mAudioDataBytesCapacity;
+
+            // 移除已拷贝数据
+            m_playback_buffer.erase(m_playback_buffer.begin(),
+                                    m_playback_buffer.begin() + frames_to_copy);
         }
-
-        size_t max_frames = buffer->mAudioDataBytesCapacity / asbd->mBytesPerFrame;
-        size_t frames_to_copy = std::min(m_playback_buffer.size(), max_frames);
-
-        // 拷贝实际数据
-        memcpy(buffer->mAudioData, m_playback_buffer.data(), frames_to_copy * sizeof(int16_t));
-        m_total_played += frames_to_copy;
-
-        size_t bytes_filled = frames_to_copy * asbd->mBytesPerFrame;
-        if (bytes_filled < buffer->mAudioDataBytesCapacity) {
-            // 不足一帧时剩余部分填充静音
-            memset(static_cast<char*>(buffer->mAudioData) + bytes_filled,
-                   0,
-                   buffer->mAudioDataBytesCapacity - bytes_filled);
-        }
-        buffer->mAudioDataByteSize = buffer->mAudioDataBytesCapacity;
-
-        // 移除已拷贝数据
-        m_playback_buffer.erase(m_playback_buffer.begin(),
-                                m_playback_buffer.begin() + frames_to_copy);
     }
 
-    // 重新入队（在锁外执行以避免死锁）
-    AudioQueueEnqueueBuffer(static_cast<AudioQueueRef>(m_queue), buffer, 0, nullptr);
+    if (should_stop) {
+        AudioQueueRef queue = static_cast<AudioQueueRef>(m_queue);
+        OSStatus st = AudioQueueStop(queue, false);
+        if (st == noErr) {
+            m_playing = false;
+        }
+        m_cv.notify_all();
+        return;
+    }
+
+    if (should_enqueue) {
+        AudioQueueEnqueueBuffer(static_cast<AudioQueueRef>(m_queue), buffer, 0, nullptr);
+    }
 }
 
 void AudioPlayer::wait_for_finish() {
@@ -224,6 +244,7 @@ void AudioPlayer::stop() {
         AudioQueueStop(queue, true);  // immediate
         m_playing = false;
     }
+    m_streaming = false;
 
     AudioQueueDispose(queue, true);
     m_queue = nullptr;

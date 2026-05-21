@@ -31,6 +31,10 @@ public:
     // 重载：播放 vector
     void play(const std::vector<int16_t>& data);
 
+    // 流式播放：start 后可多次 play 追加音频，finish 后等队列耗尽再停止
+    void start_stream();
+    void finish_stream();
+
     // 等待播放完成（阻塞）
     void wait_for_finish();
 
@@ -71,6 +75,7 @@ private:
 
     std::atomic<bool> m_initialized{false};
     std::atomic<bool> m_playing{false};
+    std::atomic<bool> m_streaming{false};
 
     // 播放数据队列
     std::vector<int16_t> m_playback_buffer;

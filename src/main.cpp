@@ -15,6 +15,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <future>
+#include <csignal>
+#include <unistd.h>
 
 // ANSI colors
 #define COLOR_CYAN    "\033[36m"
@@ -29,6 +31,16 @@
 constexpr int SAMPLES_PER_VAD_FRAME = 512;   // 32ms @16kHz
 constexpr int SAMPLE_RATE = 16000;
 constexpr bool VAD_DEBUG_LOG = false;
+
+static volatile std::sig_atomic_t g_stop_requested = 0;
+static volatile std::sig_atomic_t g_graceful_sigint_enabled = 0;
+
+static void handle_sigint(int) {
+    if (!g_graceful_sigint_enabled || g_stop_requested) {
+        _exit(130);
+    }
+    g_stop_requested = 1;
+}
 
 // 线程安全的环形缓冲
 class RingBuffer {
@@ -150,6 +162,8 @@ static bool looks_like_asr_prompt_artifact(const std::string& text) {
 }
 
 int main(int argc, char ** argv) {
+    std::signal(SIGINT, handle_sigint);
+
     // 抑制 whisper VAD 内部 debug 日志
     whisper_log_set(cb_log_disable, nullptr);
     llama_log_set(cb_log_disable, nullptr);
@@ -209,6 +223,7 @@ int main(int argc, char ** argv) {
     if (textMode) {
         std::promise<void> done;
         auto future = done.get_future();
+        g_graceful_sigint_enabled = 1;
 
         printf("%s🧠 [%s] Text mode input: \"%s\"%s\n",
                COLOR_MAGENTA, current_time_str().c_str(), textInput.c_str(), COLOR_RESET);
@@ -232,16 +247,29 @@ int main(int argc, char ** argv) {
             done.set_value();
         });
 
-        if (future.wait_for(std::chrono::minutes(5)) != std::future_status::ready) {
-            fprintf(stderr, "Semantic inference timed out.\n");
+        while (future.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) {
+            if (g_stop_requested) {
+                fprintf(stderr, "\nInterrupted.\n");
+                semanticEngine.shutdown();
+                _exit(130);
+            }
+        }
+
+        if (g_stop_requested) {
+            fprintf(stderr, "\nInterrupted.\n");
             semanticEngine.shutdown();
-            return 1;
+            _exit(130);
         }
 
         // 等待 TTS 播放完成
         printf("%s[%s] Waiting for TTS playback to finish...%s\n",
                COLOR_YELLOW, current_time_str().c_str(), COLOR_RESET);
-        semanticEngine.wait_for_tts();
+        while (!g_stop_requested && !semanticEngine.wait_for_tts_for(100)) {}
+        if (g_stop_requested) {
+            fprintf(stderr, "\nInterrupted.\n");
+            semanticEngine.shutdown();
+            _exit(130);
+        }
 
         semanticEngine.shutdown();
         return 0;
@@ -333,6 +361,7 @@ int main(int argc, char ** argv) {
     printf("%s[%s] 🔴 Recording started (16kHz, 32-bit float)%s\n",
            COLOR_GREEN, current_time_str().c_str(), COLOR_RESET);
     printf("%s──────────────────────────────────────────────────%s\n", COLOR_CYAN, COLOR_RESET);
+    g_graceful_sigint_enabled = 1;
 
     // ============================================================
     // 5. VAD + ASR 主循环
@@ -375,7 +404,7 @@ int main(int argc, char ** argv) {
     printf("%s[%s] VAD calibrated.%s\n",
            COLOR_GREEN, current_time_str().c_str(), COLOR_RESET);
 
-    while (running) {
+    while (running && !g_stop_requested) {
         std::vector<float> chunk;
         size_t got = ringBuffer.consume(chunk, SAMPLES_PER_VAD_FRAME);
 
@@ -641,6 +670,10 @@ int main(int argc, char ** argv) {
     whisper_vad_free(vctx);
     whisper_free(ctx);
     semanticEngine.shutdown();
+
+    if (g_stop_requested) {
+        _exit(130);
+    }
 
     return 0;
 }

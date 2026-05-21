@@ -31,11 +31,11 @@ public:
     // C 回调需要访问（公开给内部使用）
     bool m_continuous{false};
     AudioDataCallback m_callback;
+    void* m_audioUnit{nullptr};    // AudioUnit (VoiceProcessingIO)
 
 private:
     std::vector<float> m_audioData;
     std::atomic<bool> m_recording{false};
 
-    void* m_queue{nullptr};        // AudioQueueRef
     void* m_format{nullptr};       // AudioStreamBasicDescription
 };

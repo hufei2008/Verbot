@@ -30,6 +30,7 @@
 
 // TTS 完成回调
 using TtsEngineDoneCallback = std::function<void(bool success, const std::string& text, const std::string& msg)>;
+using TtsStreamChunkCallback = std::function<bool(const std::vector<int16_t>& pcm_chunk)>;
 
 class TtsEngine {
 public:
@@ -64,6 +65,11 @@ public:
     bool synthesize_sync(const std::string& text,
                          std::vector<int16_t>& out_pcm,
                          const std::string& spk_id = "default");
+
+    /// 流式方式：每生成一段 PCM 就回调一次。回调返回 false 可中断后续处理。
+    bool synthesize_stream(const std::string& text,
+                           const std::string& spk_id,
+                           TtsStreamChunkCallback on_chunk);
 
     // ──────────────────────────────────────────────────────
     // 异步合成

@@ -89,6 +89,7 @@ public:
 
     /// 等待当前 TTS 播放完成（text mode 优雅退出用）
     void wait_for_tts();
+    bool wait_for_tts_for(int timeout_ms);
 
     /// TTS 引擎是否就绪
     bool tts_ready() const { return m_tts_initialized; }

@@ -1,50 +1,86 @@
 #include "audio_recorder.h"
 
 #include <AudioToolbox/AudioToolbox.h>
+#include <AudioUnit/AudioUnit.h>
 #include <cstring>
 #include <iostream>
 
-// 临时 buffer 用于 continuous 模式下的转换
 static thread_local std::vector<float> t_floatBuffer;
 
-// 音频队列回调：录制到 buffer
-static void audioQueueInputCallback(
-    void * __nullable       inUserData,
-    AudioQueueRef           inAQ,
-    AudioQueueBufferRef     inBuffer,
-    const AudioTimeStamp *  inStartTime,
-    UInt32                  inNumberPacketDescriptions,
-    const AudioStreamPacketDescription * __nullable inPacketDescs) {
-
-    auto * recorder = static_cast<AudioRecorder *>(inUserData);
-    if (!recorder) return;
-
-    // inBuffer->mAudioData 是 SInt16 数据 (因为我们设定了 kAudioFormatFlagIsSignedInteger)
-    // 需要转换为 float
-    const int16_t * samples = static_cast<const int16_t *>(inBuffer->mAudioData);
-    size_t nSamples = inBuffer->mAudioDataByteSize / sizeof(int16_t);
+static void deliver_samples(AudioRecorder* recorder, const float* samples, size_t nSamples) {
+    if (!recorder || !samples || nSamples == 0) return;
 
     if (recorder->m_continuous) {
-        // continuous 模式：通过回调实时传递数据
         if (recorder->m_callback) {
-            t_floatBuffer.resize(nSamples);
-            for (size_t i = 0; i < nSamples; ++i) {
-                t_floatBuffer[i] = samples[i] / 32768.0f;
-            }
-            recorder->m_callback(t_floatBuffer.data(), nSamples);
+            recorder->m_callback(samples, nSamples);
         }
-    } else {
-        // 一次性录制模式：累积到内部 buffer
-        auto & data = const_cast<std::vector<float>&>(recorder->getAudioData());
-        size_t oldSize = data.size();
-        data.resize(oldSize + nSamples);
-        for (size_t i = 0; i < nSamples; ++i) {
-            data[oldSize + i] = samples[i] / 32768.0f;  // 归一化到 [-1, 1]
-        }
+        return;
     }
 
-    // 重新入队 buffer 以继续录制
-    AudioQueueEnqueueBuffer(inAQ, inBuffer, 0, nullptr);
+    auto& data = const_cast<std::vector<float>&>(recorder->getAudioData());
+    data.insert(data.end(), samples, samples + nSamples);
+}
+
+static OSStatus voiceProcessingInputCallback(void* inRefCon,
+                                             AudioUnitRenderActionFlags* ioActionFlags,
+                                             const AudioTimeStamp* inTimeStamp,
+                                             UInt32 inBusNumber,
+                                             UInt32 inNumberFrames,
+                                             AudioBufferList* ioData) {
+    (void)inBusNumber;
+    (void)ioData;
+
+    auto* recorder = static_cast<AudioRecorder*>(inRefCon);
+    if (!recorder || !recorder->isRecording()) {
+        return noErr;
+    }
+
+    AudioUnit audioUnit = static_cast<AudioUnit>(recorder->m_audioUnit);
+    if (!audioUnit) {
+        return noErr;
+    }
+
+    t_floatBuffer.resize(inNumberFrames);
+
+    AudioBufferList bufferList;
+    bufferList.mNumberBuffers = 1;
+    bufferList.mBuffers[0].mNumberChannels = 1;
+    bufferList.mBuffers[0].mDataByteSize = inNumberFrames * sizeof(float);
+    bufferList.mBuffers[0].mData = t_floatBuffer.data();
+
+    OSStatus status = AudioUnitRender(audioUnit,
+                                      ioActionFlags,
+                                      inTimeStamp,
+                                      1,
+                                      inNumberFrames,
+                                      &bufferList);
+    if (status != noErr) {
+        return status;
+    }
+
+    deliver_samples(recorder, t_floatBuffer.data(), inNumberFrames);
+    return noErr;
+}
+
+static OSStatus voiceProcessingOutputCallback(void* inRefCon,
+                                              AudioUnitRenderActionFlags* ioActionFlags,
+                                              const AudioTimeStamp* inTimeStamp,
+                                              UInt32 inBusNumber,
+                                              UInt32 inNumberFrames,
+                                              AudioBufferList* ioData) {
+    (void)inRefCon;
+    (void)ioActionFlags;
+    (void)inTimeStamp;
+    (void)inBusNumber;
+    (void)inNumberFrames;
+
+    if (!ioData) return noErr;
+    for (UInt32 i = 0; i < ioData->mNumberBuffers; ++i) {
+        if (ioData->mBuffers[i].mData && ioData->mBuffers[i].mDataByteSize > 0) {
+            std::memset(ioData->mBuffers[i].mData, 0, ioData->mBuffers[i].mDataByteSize);
+        }
+    }
+    return noErr;
 }
 
 AudioRecorder::AudioRecorder() {}
@@ -64,79 +100,172 @@ bool AudioRecorder::start(bool continuous) {
     }
 
     m_continuous = continuous;
+    m_audioData.clear();
 
-    // 设置音频格式: 16kHz, 16-bit mono PCM
     AudioStreamBasicDescription desc = {};
     desc.mSampleRate = 16000.0;
     desc.mFormatID = kAudioFormatLinearPCM;
-    desc.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
-    desc.mBytesPerPacket = 2;
+    desc.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+    desc.mBytesPerPacket = sizeof(float);
     desc.mFramesPerPacket = 1;
-    desc.mBytesPerFrame = 2;
+    desc.mBytesPerFrame = sizeof(float);
     desc.mChannelsPerFrame = 1;
-    desc.mBitsPerChannel = 16;
+    desc.mBitsPerChannel = 32;
 
     m_format = new AudioStreamBasicDescription(desc);
 
-    AudioQueueRef queue = nullptr;
-    OSStatus status = AudioQueueNewInput(
-        static_cast<const AudioStreamBasicDescription *>(m_format),
-        audioQueueInputCallback,
-        this,           // user data
-        nullptr,        // run loop (null = current)
-        nullptr,        // run loop mode
-        0,              // flags
-        &queue
-    );
+    AudioComponentDescription componentDesc = {};
+    componentDesc.componentType = kAudioUnitType_Output;
+    componentDesc.componentSubType = kAudioUnitSubType_VoiceProcessingIO;
+    componentDesc.componentManufacturer = kAudioUnitManufacturer_Apple;
 
-    if (status != noErr) {
-        std::cerr << "Failed to create AudioQueue: " << status << std::endl;
-        delete static_cast<AudioStreamBasicDescription *>(m_format);
+    AudioComponent component = AudioComponentFindNext(nullptr, &componentDesc);
+    if (!component) {
+        std::cerr << "Failed to find VoiceProcessingIO AudioUnit." << std::endl;
+        delete static_cast<AudioStreamBasicDescription*>(m_format);
         m_format = nullptr;
         return false;
     }
 
-    m_queue = queue;
-
-    // 分配 3 个 buffer，每个 0.5 秒
-    UInt32 bufferSize = 16000 * sizeof(int16_t) / 2; // 0.5s = 8000 samples
-    for (int i = 0; i < 3; ++i) {
-        AudioQueueBufferRef buffer = nullptr;
-        AudioQueueAllocateBuffer(queue, bufferSize, &buffer);
-        AudioQueueEnqueueBuffer(queue, buffer, 0, nullptr);
+    AudioUnit audioUnit = nullptr;
+    OSStatus status = AudioComponentInstanceNew(component, &audioUnit);
+    if (status != noErr || !audioUnit) {
+        std::cerr << "Failed to create VoiceProcessingIO AudioUnit: " << status << std::endl;
+        delete static_cast<AudioStreamBasicDescription*>(m_format);
+        m_format = nullptr;
+        return false;
     }
 
-    m_audioData.clear();
+    m_audioUnit = audioUnit;
+
+    UInt32 enable = 1;
+    status = AudioUnitSetProperty(audioUnit,
+                                  kAudioOutputUnitProperty_EnableIO,
+                                  kAudioUnitScope_Output,
+                                  0,
+                                  &enable,
+                                  sizeof(enable));
+    if (status != noErr) {
+        std::cerr << "Warning: failed to enable VoiceProcessingIO output: " << status << std::endl;
+    }
+
+    status = AudioUnitSetProperty(audioUnit,
+                                  kAudioOutputUnitProperty_EnableIO,
+                                  kAudioUnitScope_Input,
+                                  1,
+                                  &enable,
+                                  sizeof(enable));
+    if (status != noErr) {
+        std::cerr << "Failed to enable VoiceProcessingIO input: " << status << std::endl;
+        stop();
+        return false;
+    }
+
+    UInt32 bypass = 0;
+    status = AudioUnitSetProperty(audioUnit,
+                                  kAUVoiceIOProperty_BypassVoiceProcessing,
+                                  kAudioUnitScope_Global,
+                                  1,
+                                  &bypass,
+                                  sizeof(bypass));
+    if (status != noErr) {
+        std::cerr << "Warning: failed to enable voice processing, status=" << status << std::endl;
+    }
+
+    UInt32 agc = 1;
+    status = AudioUnitSetProperty(audioUnit,
+                                  kAUVoiceIOProperty_VoiceProcessingEnableAGC,
+                                  kAudioUnitScope_Global,
+                                  1,
+                                  &agc,
+                                  sizeof(agc));
+    if (status != noErr) {
+        std::cerr << "Warning: failed to enable VoiceProcessingIO AGC, status=" << status << std::endl;
+    }
+
+    status = AudioUnitSetProperty(audioUnit,
+                                  kAudioUnitProperty_StreamFormat,
+                                  kAudioUnitScope_Output,
+                                  1,
+                                  &desc,
+                                  sizeof(desc));
+    if (status != noErr) {
+        std::cerr << "Failed to set VoiceProcessingIO input format: " << status << std::endl;
+        stop();
+        return false;
+    }
+
+    status = AudioUnitSetProperty(audioUnit,
+                                  kAudioUnitProperty_StreamFormat,
+                                  kAudioUnitScope_Input,
+                                  0,
+                                  &desc,
+                                  sizeof(desc));
+    if (status != noErr) {
+        std::cerr << "Warning: failed to set VoiceProcessingIO output format: " << status << std::endl;
+    }
+
+    AURenderCallbackStruct callback = {};
+    callback.inputProc = voiceProcessingInputCallback;
+    callback.inputProcRefCon = this;
+    status = AudioUnitSetProperty(audioUnit,
+                                  kAudioOutputUnitProperty_SetInputCallback,
+                                  kAudioUnitScope_Global,
+                                  1,
+                                  &callback,
+                                  sizeof(callback));
+    if (status != noErr) {
+        std::cerr << "Failed to set VoiceProcessingIO input callback: " << status << std::endl;
+        stop();
+        return false;
+    }
+
+    AURenderCallbackStruct outputCallback = {};
+    outputCallback.inputProc = voiceProcessingOutputCallback;
+    outputCallback.inputProcRefCon = this;
+    status = AudioUnitSetProperty(audioUnit,
+                                  kAudioUnitProperty_SetRenderCallback,
+                                  kAudioUnitScope_Input,
+                                  0,
+                                  &outputCallback,
+                                  sizeof(outputCallback));
+    if (status != noErr) {
+        std::cerr << "Warning: failed to set VoiceProcessingIO output callback: " << status << std::endl;
+    }
+
+    status = AudioUnitInitialize(audioUnit);
+    if (status != noErr) {
+        std::cerr << "Failed to initialize VoiceProcessingIO AudioUnit: " << status << std::endl;
+        stop();
+        return false;
+    }
+
     m_recording = true;
 
-    status = AudioQueueStart(queue, nullptr);
+    status = AudioOutputUnitStart(audioUnit);
     if (status != noErr) {
-        std::cerr << "Failed to start AudioQueue: " << status << std::endl;
-        AudioQueueDispose(queue, true);
-        m_queue = nullptr;
-        delete static_cast<AudioStreamBasicDescription *>(m_format);
-        m_format = nullptr;
-        m_recording = false;
+        std::cerr << "Failed to start VoiceProcessingIO AudioUnit: " << status << std::endl;
+        stop();
         return false;
     }
 
+    std::cout << "[AudioRecorder] Started with VoiceProcessingIO (AEC/NS/AGC path), 16kHz float mono" << std::endl;
     return true;
 }
 
 void AudioRecorder::stop() {
-    if (!m_recording) return;
+    AudioUnit audioUnit = static_cast<AudioUnit>(m_audioUnit);
 
-    m_recording = false;
-
-    AudioQueueRef queue = static_cast<AudioQueueRef>(m_queue);
-    if (queue) {
-        AudioQueueStop(queue, true);
-        AudioQueueDispose(queue, true);
-        m_queue = nullptr;
+    if (audioUnit) {
+        AudioOutputUnitStop(audioUnit);
+        AudioUnitUninitialize(audioUnit);
+        AudioComponentInstanceDispose(audioUnit);
+        m_audioUnit = nullptr;
     }
 
-    delete static_cast<AudioStreamBasicDescription *>(m_format);
+    delete static_cast<AudioStreamBasicDescription*>(m_format);
     m_format = nullptr;
+    m_recording = false;
 }
 
 const std::vector<float>& AudioRecorder::getAudioData() const {

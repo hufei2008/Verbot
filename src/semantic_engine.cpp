@@ -7,6 +7,7 @@
 #include <vector>
 #include <thread>
 #include <cstdlib>
+#include <chrono>
 
 namespace {
 
@@ -429,15 +430,65 @@ void SemanticEngine::speak(const std::string& text, const std::string& spk_id) {
         {
             std::lock_guard<std::mutex> serial_lock(m_tts_serial_mutex);
 
-            std::vector<int16_t> pcm;
-            if (synthesize_text(text, pcm, spk_id)) {
-                fprintf(stdout, "[TTS] Speaking reply: \"%s\"\n", text.c_str());
-                fprintf(stdout, "[TTS] Playing %zu samples (%.2f sec)\n",
-                        pcm.size(),
-                        (double)pcm.size() / 22050.0);
+            fprintf(stdout, "[TTS] Streaming reply: \"%s\"\n", text.c_str());
 
-                m_audio_player.play(pcm);
+            size_t total_samples = 0;
+            size_t buffered_samples = 0;
+            int chunk_count = 0;
+            bool playback_started = false;
+            std::vector<int16_t> pending_pcm;
+
+            double start_buffer_sec = 2.5;
+            if (const char* env_buffer = std::getenv("COSYVOICE_STREAM_START_BUFFER_SEC")) {
+                try {
+                    start_buffer_sec = std::max(0.0, std::atof(env_buffer));
+                } catch (...) {
+                    start_buffer_sec = 2.5;
+                }
+            }
+            const size_t start_buffer_samples = (size_t)(start_buffer_sec * 22050.0);
+
+            auto start_playback = [&]() {
+                if (playback_started || pending_pcm.empty()) return;
+                m_audio_player.start_stream();
+                m_audio_player.play(pending_pcm);
+                playback_started = true;
+                fprintf(stdout, "[TTS] Playback started after buffering %.2f sec (%zu samples)\n",
+                        (double)pending_pcm.size() / 22050.0, pending_pcm.size());
+                pending_pcm.clear();
+            };
+
+            bool ok = m_tts_engine.synthesize_stream(text, spk_id,
+                [this, &total_samples, &buffered_samples, &chunk_count,
+                 &pending_pcm, &playback_started, start_buffer_samples, &start_playback]
+                (const std::vector<int16_t>& pcm) {
+                    total_samples += pcm.size();
+                    chunk_count++;
+                    fprintf(stdout, "[TTS] Streaming chunk #%d: %zu samples (total %.2f sec)\n",
+                            chunk_count, pcm.size(), (double)total_samples / 22050.0);
+
+                    if (!playback_started) {
+                        pending_pcm.insert(pending_pcm.end(), pcm.begin(), pcm.end());
+                        buffered_samples = pending_pcm.size();
+                        if (buffered_samples >= start_buffer_samples) {
+                            start_playback();
+                        }
+                    } else {
+                        m_audio_player.play(pcm);
+                    }
+                    return true;
+                });
+
+            if (!playback_started) {
+                start_playback();
+            }
+            m_audio_player.finish_stream();
+            if (ok) {
+                fprintf(stdout, "[TTS] Stream playback queued: %zu samples in %d chunks (%.2f sec)\n",
+                        total_samples, chunk_count, (double)total_samples / 22050.0);
                 m_audio_player.wait_for_finish();
+            } else {
+                fprintf(stderr, "[TTS] Stream synthesis failed for: \"%s\"\n", text.c_str());
             }
         }
 
@@ -452,6 +503,13 @@ void SemanticEngine::speak(const std::string& text, const std::string& spk_id) {
 void SemanticEngine::wait_for_tts() {
     std::unique_lock<std::mutex> lock(m_tts_mutex);
     m_tts_cv.wait(lock, [this]() {
+        return m_tts_active_jobs == 0;
+    });
+}
+
+bool SemanticEngine::wait_for_tts_for(int timeout_ms) {
+    std::unique_lock<std::mutex> lock(m_tts_mutex);
+    return m_tts_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this]() {
         return m_tts_active_jobs == 0;
     });
 }

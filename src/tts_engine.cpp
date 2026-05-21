@@ -264,6 +264,101 @@ bool TtsEngine::synthesize_sync(const std::string& text,
     return true;
 }
 
+bool TtsEngine::synthesize_stream(const std::string& text,
+                                  const std::string& spk_id,
+                                  TtsStreamChunkCallback on_chunk) {
+    if (!m_initialized) {
+        fprintf(stderr, "[TtsEngine] Not initialized!\n");
+        return false;
+    }
+    if (!on_chunk) {
+        fprintf(stderr, "[TtsEngine] Missing stream chunk callback!\n");
+        return false;
+    }
+
+    PyGILState_STATE gstate = PyGILState_Ensure();
+
+    PyObject* bridge = static_cast<PyObject*>(m_py_bridge_module);
+    PyObject* generator = PyObject_CallMethod(bridge, "synthesize_stream", "(sss)",
+                                              text.c_str(),
+                                              spk_id.c_str(),
+                                              "sft");
+    if (!generator) {
+        PyErr_Print();
+        PyGILState_Release(gstate);
+        fprintf(stderr, "[TtsEngine] bridge.synthesize_stream() failed!\n");
+        return false;
+    }
+
+    PyObject* iterator = PyObject_GetIter(generator);
+    Py_DECREF(generator);
+    if (!iterator) {
+        PyErr_Print();
+        PyGILState_Release(gstate);
+        fprintf(stderr, "[TtsEngine] synthesize_stream result is not iterable!\n");
+        return false;
+    }
+
+    bool ok = true;
+    size_t total_samples = 0;
+    int chunk_count = 0;
+
+    while (ok) {
+        PyObject* chunk = PyIter_Next(iterator);
+        if (!chunk) {
+            if (PyErr_Occurred()) {
+                PyErr_Print();
+                ok = false;
+            }
+            break;
+        }
+
+        PyObject* buffer = PyObject_CallMethod(chunk, "tobytes", nullptr);
+        if (!buffer) {
+            PyErr_Print();
+            Py_DECREF(chunk);
+            ok = false;
+            break;
+        }
+
+        const char* buf_data = nullptr;
+        Py_ssize_t buf_len = 0;
+        if (PyBytes_AsStringAndSize(buffer, const_cast<char**>(&buf_data), &buf_len) == -1) {
+            Py_DECREF(buffer);
+            Py_DECREF(chunk);
+            ok = false;
+            break;
+        }
+
+        std::vector<int16_t> pcm(buf_len / sizeof(int16_t));
+        if (!pcm.empty()) {
+            memcpy(pcm.data(), buf_data, pcm.size() * sizeof(int16_t));
+            total_samples += pcm.size();
+            chunk_count++;
+        }
+
+        Py_DECREF(buffer);
+        Py_DECREF(chunk);
+
+        if (!pcm.empty() && !on_chunk(pcm)) {
+            ok = false;
+            break;
+        }
+    }
+
+    Py_DECREF(iterator);
+    PyGILState_Release(gstate);
+
+    if (ok) {
+        fprintf(stdout, "[TtsEngine] Stream synthesized %zu samples in %d chunks (%.2f sec)\n",
+                total_samples, chunk_count, (double)total_samples / 22050.0);
+    } else {
+        fprintf(stderr, "[TtsEngine] Stream synthesis failed or interrupted after %zu samples\n",
+                total_samples);
+    }
+    return ok && total_samples > 0;
+}
+
 // ============================================================
 // 异步合成
 // ============================================================
