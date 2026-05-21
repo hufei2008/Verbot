@@ -20,3 +20,5 @@ models/*
 
 # Test audio
 test_speech.wav
+# Python cache
+__pycache__/

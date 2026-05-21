@@ -1,4 +1,5 @@
 #include "audio_recorder.h"
+#include "semantic_engine.h"
 
 #include "whisper.h"
 
@@ -12,6 +13,8 @@
 #include <algorithm>
 #include <ctime>
 #include <cmath>
+#include <cstdlib>
+#include <future>
 
 // ANSI colors
 #define COLOR_CYAN    "\033[36m"
@@ -25,6 +28,7 @@
 
 constexpr int SAMPLES_PER_VAD_FRAME = 512;   // 32ms @16kHz
 constexpr int SAMPLE_RATE = 16000;
+constexpr bool VAD_DEBUG_LOG = false;
 
 // 线程安全的环形缓冲
 class RingBuffer {
@@ -84,11 +88,7 @@ static float compute_peak(const float* data, size_t n) {
 }
 
 // ★ 改进：简单高通 FIR 滤波器，滤除 80Hz 以下低频噪声（空调/风扇/风声）
-// 显著提升 VAD 准确率和 Whisper 识别率
 static void highpass_filter(std::vector<float>& data, float cutoff, int sampleRate) {
-    // 一阶 IIR 高通：y[n] = 0.5 * (x[n] - x[n-1]) + 0.5 * y[n-1] * alpha
-    // 但更简单有效：使用 RC 高通滤波器
-    // alpha = RC / (RC + dt)，其中 RC = 1/(2*pi*cutoff)
     const float dt = 1.0f / sampleRate;
     const float rc = 1.0f / (2.0f * M_PI * cutoff);
     const float alpha = rc / (rc + dt);
@@ -103,38 +103,171 @@ static void highpass_filter(std::vector<float>& data, float cutoff, int sampleRa
     }
 }
 
+static void execute_action(const Action& action) {
+    switch (action.type) {
+        case ActionType::OPEN_APP: {
+            std::string cmd = "open -a \"" + action.target + "\"";
+            printf("%s  ↪ Opening app: %s%s\n",
+                   COLOR_YELLOW, cmd.c_str(), COLOR_RESET);
+            std::system(cmd.c_str());
+            break;
+        }
+        case ActionType::SEARCH_WEB: {
+            std::string url = "https://www.google.com/search?q=" + action.target;
+            for (auto& c : url) { if (c == ' ') c = '+'; }
+            std::string cmd = "open \"" + url + "\"";
+            printf("%s  ↪ Searching: %s%s\n",
+                   COLOR_YELLOW, url.c_str(), COLOR_RESET);
+            std::system(cmd.c_str());
+            break;
+        }
+        case ActionType::GET_TIME: {
+            printf("%s  ↪ Current time: %s%s\n",
+                   COLOR_YELLOW, current_time_str().c_str(), COLOR_RESET);
+            break;
+        }
+        default: {
+            if (action.type != ActionType::NONE) {
+                printf("%s  ↪ (No safe handler for %s)%s\n",
+                       COLOR_YELLOW, action.action_name.c_str(), COLOR_RESET);
+            }
+            break;
+        }
+    }
+}
+
+static bool looks_like_asr_prompt_artifact(const std::string& text) {
+    if (text.empty()) return true;
+    if (text == "嗯" || text == "嗯嗯" || text == "啊" || text == "哦") return true;
+    if (text == "咳" || text == "咳咳" || text == "咳咳咳") return true;
+    if (text.find("打开关闭保存删除复制粘贴撤回发送") != std::string::npos) return true;
+    if (text.find("请问有什么可以帮助你的") != std::string::npos &&
+        text.find("他说他们说") != std::string::npos) return true;
+    if (text.size() > 90 &&
+        text.find("今天天气很好") != std::string::npos &&
+        text.find("一二三四") != std::string::npos) return true;
+    return false;
+}
+
 int main(int argc, char ** argv) {
     // 抑制 whisper VAD 内部 debug 日志
     whisper_log_set(cb_log_disable, nullptr);
+    llama_log_set(cb_log_disable, nullptr);
 
-    std::string modelPath    = "models/ggml-medium.bin";
-    std::string vadModelPath = "models/ggml-silero-v6.2.0.bin";
+    std::string whisperModel  = "models/ggml-medium.bin";
+    std::string vadModelPath  = "models/ggml-silero-v6.2.0.bin";
+    std::string llmModelPath  = "models/gemma4-26b-a4b-it-q4_k_m.gguf";
+    std::string textInput;
 
-    if (argc > 1) modelPath    = argv[1];
-    if (argc > 2) vadModelPath = argv[2];
+    bool textMode = false;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--text" && i + 1 < argc) {
+            textMode = true;
+            textInput = argv[++i];
+        } else if (arg == "--llm" && i + 1 < argc) {
+            llmModelPath = argv[++i];
+        } else if (!textMode) {
+            if (i == 1) whisperModel = arg;
+            else if (i == 2) vadModelPath = arg;
+            else if (i == 3) llmModelPath = arg;
+        }
+    }
+
+    if (textMode && textInput.empty()) {
+        fprintf(stderr, "Usage: %s --text \"打开计算器\" [--llm path/to/model.gguf]\n", argv[0]);
+        return 1;
+    }
 
     // ============================================================
-    // 1. 初始化 Whisper
+    // 1. 初始化语义引擎（LLM + TTS）
+    // ============================================================
+    printf("%s[%s] Loading LLM model: %s ...%s\n",
+           COLOR_CYAN, current_time_str().c_str(), llmModelPath.c_str(), COLOR_RESET);
+
+    SemanticEngine semanticEngine;
+    if (!semanticEngine.init(llmModelPath, 4096, 4, true)) {
+        fprintf(stderr, "Failed to initialize semantic engine!\n");
+        return 1;
+    }
+    printf("%s[%s] Semantic engine ready.%s\n",
+           COLOR_GREEN, current_time_str().c_str(), COLOR_RESET);
+
+    // TTS 状态
+    if (semanticEngine.tts_ready()) {
+        printf("%s[%s] TTS ready (Embedded CosyVoice via Python bridge)%s\n",
+               COLOR_GREEN, current_time_str().c_str(), COLOR_RESET);
+    } else {
+        printf("%s[%s] TTS not available. "
+               "To enable, set:\n"
+               "  export COSYVOICE_MODEL_DIR=/path/to/CosyVoice/pretrained_models/CosyVoice-300M\n"
+               "  export COSYVOICE_PYTHON_HOME=/path/to/conda/envs/cosyvoice\n"
+               "  export COSYVOICE_BRIDGE_DIR=/path/to/study2/python%s\n",
+               COLOR_YELLOW, current_time_str().c_str(), COLOR_RESET);
+    }
+
+    if (textMode) {
+        std::promise<void> done;
+        auto future = done.get_future();
+
+        printf("%s🧠 [%s] Text mode input: \"%s\"%s\n",
+               COLOR_MAGENTA, current_time_str().c_str(), textInput.c_str(), COLOR_RESET);
+
+        semanticEngine.process_asr_result(textInput, [&](const Action& action) {
+            if (!action.response_text.empty()) {
+                printf("\n%s🤖 %s%s\n",
+                       COLOR_BOLD COLOR_CYAN, action.response_text.c_str(), COLOR_RESET);
+                // TTS 由 SemanticEngine 内部自动处理
+            }
+
+            if (action.type != ActionType::NONE) {
+                printf("%s⚡ [Action] %s: %s%s\n",
+                       COLOR_BOLD COLOR_GREEN,
+                       action.action_name.c_str(),
+                       action.target.c_str(),
+                       COLOR_RESET);
+                execute_action(action);
+            }
+
+            done.set_value();
+        });
+
+        if (future.wait_for(std::chrono::minutes(5)) != std::future_status::ready) {
+            fprintf(stderr, "Semantic inference timed out.\n");
+            semanticEngine.shutdown();
+            return 1;
+        }
+
+        // 等待 TTS 播放完成
+        printf("%s[%s] Waiting for TTS playback to finish...%s\n",
+               COLOR_YELLOW, current_time_str().c_str(), COLOR_RESET);
+        semanticEngine.wait_for_tts();
+
+        semanticEngine.shutdown();
+        return 0;
+    }
+
+    // ============================================================
+    // 2. 初始化 Whisper
     // ============================================================
     printf("%s[%s] Loading Whisper model: %s ...%s\n",
-           COLOR_CYAN, current_time_str().c_str(), modelPath.c_str(), COLOR_RESET);
+           COLOR_CYAN, current_time_str().c_str(), whisperModel.c_str(), COLOR_RESET);
 
-    // 启用 GPU（Metal）加速，Apple Silicon 上约 3-5x 加速
     whisper_context_params cparams = whisper_context_default_params();
     cparams.use_gpu = true;
-    // Metal 设备数量（Apple Silicon 统一内存）
     cparams.gpu_device = 0;
 
-    struct whisper_context * ctx = whisper_init_from_file_with_params(modelPath.c_str(), cparams);
+    struct whisper_context * ctx = whisper_init_from_file_with_params(whisperModel.c_str(), cparams);
     if (!ctx) {
         std::cerr << "Failed to load Whisper model!" << std::endl;
+        semanticEngine.shutdown();
         return 1;
     }
     printf("%s[%s] Whisper model loaded.%s\n",
            COLOR_GREEN, current_time_str().c_str(), COLOR_RESET);
 
     // ============================================================
-    // 2. 初始化 VAD
+    // 3. 初始化 VAD
     // ============================================================
     printf("%s[%s] Loading VAD model: %s ...%s\n",
            COLOR_CYAN, current_time_str().c_str(), vadModelPath.c_str(), COLOR_RESET);
@@ -148,6 +281,7 @@ int main(int argc, char ** argv) {
     if (!vctx) {
         std::cerr << "Failed to load VAD model!" << std::endl;
         whisper_free(ctx);
+        semanticEngine.shutdown();
         return 1;
     }
     printf("%s[%s] VAD model loaded.%s\n",
@@ -157,7 +291,7 @@ int main(int argc, char ** argv) {
     struct whisper_vad_params vad_params = whisper_vad_default_params();
     vad_params.threshold               = 0.5f;
     vad_params.min_speech_duration_ms  = 200;
-    vad_params.min_silence_duration_ms = 300;   // ⬇ 从 600ms 降到 300ms，减少结束等待
+    vad_params.min_silence_duration_ms = 300;
     vad_params.speech_pad_ms           = 200;
 
     printf("%s[%s] VAD params: thr=%.1f, min_speech=%dms, min_silence=%dms, pad=%dms%s\n",
@@ -169,7 +303,7 @@ int main(int argc, char ** argv) {
            COLOR_RESET);
 
     // ============================================================
-    // 3. 启动录音（流式模式）
+    // 4. 启动录音
     // ============================================================
     RingBuffer ringBuffer;
     std::atomic<bool> running{true};
@@ -183,6 +317,7 @@ int main(int argc, char ** argv) {
         std::cerr << "Failed to start recording!" << std::endl;
         whisper_vad_free(vctx);
         whisper_free(ctx);
+        semanticEngine.shutdown();
         return 1;
     }
 
@@ -191,8 +326,8 @@ int main(int argc, char ** argv) {
     // ============================================================
     printf(CLEAR_SCREEN);
     printf("%s╔════════════════════════════════════════════════════╗%s\n", COLOR_BOLD COLOR_MAGENTA, COLOR_RESET);
-    printf("%s║       🎙  Real-time ASR (Whisper + VAD)          ║%s\n", COLOR_BOLD COLOR_MAGENTA, COLOR_RESET);
-    printf("%s║       Press Ctrl+C to exit                       ║%s\n", COLOR_BOLD COLOR_MAGENTA, COLOR_RESET);
+    printf("%s║    🎙  Real-time ASR + Semantic Understanding     ║%s\n", COLOR_BOLD COLOR_MAGENTA, COLOR_RESET);
+    printf("%s║    Press Ctrl+C to exit                           ║%s\n", COLOR_BOLD COLOR_MAGENTA, COLOR_RESET);
     printf("%s╚════════════════════════════════════════════════════╝%s\n", COLOR_BOLD COLOR_MAGENTA, COLOR_RESET);
     printf("\n");
     printf("%s[%s] 🔴 Recording started (16kHz, 32-bit float)%s\n",
@@ -200,21 +335,12 @@ int main(int argc, char ** argv) {
     printf("%s──────────────────────────────────────────────────%s\n", COLOR_CYAN, COLOR_RESET);
 
     // ============================================================
-    // 4. VAD + ASR 主循环 - 增强版状态机
-    // ============================================================
-    //
-    // 改进要点：
-    //   1) 语音开始前预留 200ms 静音作为上下文（pad）
-    //   2) 语音结束后追加 200ms 静音（pad）
-    //   3) 说话中判断条件放宽：VAD 或 能量，任一触发即认为有语音
-    //   4) 去除 no_context，让 Whisper 利用上下文提升准确率
-    //   5) 动态阈值自适应
-    //
+    // 5. VAD + ASR 主循环
     // ============================================================
 
     enum State {
         STATE_IDLE,
-        STATE_SPEECHING,    // 正在说话
+        STATE_SPEECHING,
     };
 
     State state = STATE_IDLE;
@@ -222,35 +348,24 @@ int main(int argc, char ** argv) {
     std::vector<float> speechBuffer;
     int speechCount = 0;
     int vadStartCount = 0;
-
-    // 语音段累计帧数
     int speechFrames = 0;
 
-    // 连续静音帧计数器（用于检测语音结束）
-    const int SILENCE_FRAMES_THRESHOLD = 8;   // ⬇ 8帧 * 32ms = 256ms 静音判定结束（从640ms降低）
+    const int SILENCE_FRAMES_THRESHOLD = 8;
     int silenceFrames = 0;
 
-    // 最小语音帧数（避免过短触发）
-    const int MIN_SPEECH_FRAMES = 6;   // 6帧 * 32ms = 192ms，短词也能识别
+    const int MIN_SPEECH_FRAMES = 6;
+    const int MAX_SPEECH_FRAMES = 30 * 1000 / 32;
 
-    // 最大语音帧数（强制转写）
-    const int MAX_SPEECH_FRAMES = 30 * 1000 / 32;  // ~30s
-
-    // RMS 阈值 - 降低到 0.01，适应麦克风增益较小的场景
     const float SPEECH_RMS_THRESHOLD = 0.01f;
-
-    // 底噪自适应
     float noiseFloor = 0.01f;
 
-    // 用于语音段 padding 的环形缓冲（保留最近 500ms 音频）
-    const int PAD_FRAMES = 8;  // 8帧 ≈ 256ms 的 padding
+    const int PAD_FRAMES = 8;
     std::vector<float> padBuffer;
 
-    // 先向 VAD 输入一些静音帧做校准
+    // 先向 VAD 输入静音帧做校准
     printf("%s[%s] Calibrating VAD (300ms of silence)...%s\n",
            COLOR_YELLOW, current_time_str().c_str(), COLOR_RESET);
 
-    // 给 VAD 喂静音帧做校准
     std::vector<float> silenceInput(SAMPLES_PER_VAD_FRAME, 0.0f);
     for (int i = 0; i < 5; ++i) {
         whisper_vad_detect_speech_no_reset(vctx, silenceInput.data(), SAMPLES_PER_VAD_FRAME);
@@ -261,7 +376,6 @@ int main(int argc, char ** argv) {
            COLOR_GREEN, current_time_str().c_str(), COLOR_RESET);
 
     while (running) {
-        // 从环形缓冲取数据
         std::vector<float> chunk;
         size_t got = ringBuffer.consume(chunk, SAMPLES_PER_VAD_FRAME);
 
@@ -270,42 +384,24 @@ int main(int argc, char ** argv) {
             continue;
         }
 
-        // 计算 RMS 能量和峰值
         float rms = compute_rms(chunk.data(), (int)chunk.size());
         float peak = compute_peak(chunk.data(), (int)chunk.size());
 
-        // 更新底噪估计（只在空闲时更新更准确）
         if (state == STATE_IDLE && rms < SPEECH_RMS_THRESHOLD * 3.0f) {
             noiseFloor = 0.995f * noiseFloor + 0.005f * rms;
         }
 
-        // 运行 VAD
         bool vadSpeech = whisper_vad_detect_speech_no_reset(vctx,
                 chunk.data(), (int)chunk.size());
 
-        // ---- ★ 关键改进：综合决策逻辑 ★ ----
-        // 使用能量检测（但用自适应阈值 = max(noiseFloor*2, SPEECH_RMS_THRESHOLD)）
         float adaptiveThreshold = std::max(noiseFloor * 3.0f, SPEECH_RMS_THRESHOLD);
         bool energyHasSpeech = (rms >= adaptiveThreshold);
 
-        // IDLE 状态：需要 VAD 和能量同时触发（严格，防止误触发）
-        // SPEECHING 状态：同样用 AND - 必须 VAD 和能量都认为是语音才保持
-        // 修复前用了 OR，导致任一检测不断重置 silenceFrames，永远结束不了
-        bool isSpeech;
-        if (state == STATE_IDLE) {
-            // ★ 严格模式：VAD + 能量双确认才判定为语音开始
-            isSpeech = vadSpeech && energyHasSpeech;
-        } else {
-            // ★ 修复：改为 AND 判断
-            //   isSpeech=true:  VAD和能量都认为有语音 → 继续说话，重置静音计数
-            //   isSpeech=false: 只要有一方认为无语音 → 不重置静音计数
-            //   这样即使偶发噪声/误判也不会让 silenceFrames 永远归零
-            isSpeech = vadSpeech && energyHasSpeech;
-        }
+        bool isSpeech = vadSpeech && energyHasSpeech;
 
-        // ★ 调试日志：打印每帧的 VAD/能量/判定结果
+        // VAD 调试日志（每 30 帧或说话时打印）
         static int logCounter = 0;
-        if (++logCounter % 30 == 0 || state == STATE_SPEECHING) {
+        if (VAD_DEBUG_LOG && (++logCounter % 30 == 0 || state == STATE_SPEECHING)) {
             printf("%s[DEBUG] frame: vad=%d rms=%.4f peak=%.4f thr=%.4f noise=%.4f energy=%d isSpeech=%d state=%s silence=%d%s\n",
                    COLOR_CYAN,
                    (int)vadSpeech, rms, peak, adaptiveThreshold, noiseFloor,
@@ -315,28 +411,24 @@ int main(int argc, char ** argv) {
                    COLOR_RESET);
         }
 
-        // ---- 更新 padding 环形缓冲 ----
+        // 更新 padding 环形缓冲
         padBuffer.insert(padBuffer.end(), chunk.begin(), chunk.end());
         if (padBuffer.size() > (size_t)PAD_FRAMES * SAMPLES_PER_VAD_FRAME) {
             padBuffer.erase(padBuffer.begin(), padBuffer.begin() + SAMPLES_PER_VAD_FRAME);
         }
 
-        // 状态机
         switch (state) {
             case STATE_IDLE: {
                 if (isSpeech) {
-                    // 检测到语音，开始累积
                     state = STATE_SPEECHING;
                     speechFrames = 0;
                     silenceFrames = 0;
                     vadStartCount++;
 
-                    // ★ 改进：把 padding 中的最近音频作为语音前导上下文加入
                     speechBuffer.clear();
                     speechBuffer.insert(speechBuffer.end(), padBuffer.begin(), padBuffer.end());
                     speechFrames += (int)(padBuffer.size() / SAMPLES_PER_VAD_FRAME);
 
-                    // 当前帧也要入 buffer
                     speechBuffer.insert(speechBuffer.end(), chunk.begin(), chunk.end());
                     speechFrames++;
 
@@ -348,29 +440,21 @@ int main(int argc, char ** argv) {
             }
 
             case STATE_SPEECHING: {
-                // 累积当前帧
                 speechBuffer.insert(speechBuffer.end(), chunk.begin(), chunk.end());
                 speechFrames++;
 
                 if (isSpeech) {
-                    // 还在说话，重置静音计数器
                     silenceFrames = 0;
                 } else {
-                    // VAD 和能量都不够了，开始计数静音帧
                     silenceFrames++;
                 }
 
-                // 检查条件
                 if (silenceFrames >= SILENCE_FRAMES_THRESHOLD) {
-                    // 连续静音达到阈值 -> 语音结束
                     if (speechFrames >= MIN_SPEECH_FRAMES) {
-                        // ★ 改进：语音结束后追加 padding 帧作为上下文
                         speechBuffer.insert(speechBuffer.end(),
                             padBuffer.begin(), padBuffer.end());
-
                         goto do_transcribe;
                     } else {
-                        // 太短了，丢弃
                         float durMs = speechFrames * 32.0f;
                         state = STATE_IDLE;
                         speechBuffer.clear();
@@ -381,25 +465,21 @@ int main(int argc, char ** argv) {
                                durMs, COLOR_RESET);
                     }
                 } else if (speechFrames >= MAX_SPEECH_FRAMES) {
-                    // 语音太长，强制转写
                     printf("%s⏰ [%s] Speech too long (%.0fs), force-transcribing...%s\n",
                            COLOR_YELLOW, current_time_str().c_str(),
                            speechFrames * 32.0f / 1000.0f, COLOR_RESET);
                     whisper_vad_reset_state(vctx);
                     goto do_transcribe;
                 }
-
-                // 正常流程：继续累积
                 break;
             }
         }
 
-        // 跳过转写
         continue;
 
     do_transcribe:
         {
-            // ★ 改进：对语音段应用高通滤波，去除低频噪声，提升 Whisper 识别率
+            // 高通滤波
             highpass_filter(speechBuffer, 80.0f, SAMPLE_RATE);
 
             double durSec = speechBuffer.size() / (double)SAMPLE_RATE;
@@ -417,45 +497,34 @@ int main(int argc, char ** argv) {
             wparams.language         = "zh";
             wparams.n_threads        = std::min(4, (int)std::thread::hardware_concurrency());
 
-    // ---------- 关键改进（v2）：提升识别准确率 ----------
-    wparams.no_context       = false;        // 利用上下文提升准确率
-    wparams.single_segment   = false;        // 允许 Whisper 内部自动分段和对齐
+            wparams.no_context       = false;
+            wparams.single_segment   = false;
+            wparams.suppress_blank   = true;
+            wparams.suppress_nst     = true;
 
-    // suppress_blank: 抑制空输出
-    wparams.suppress_blank   = true;
-    // suppress_nst: 抑制非语音 token（如背景噪声标记）
-    wparams.suppress_nst     = true;
+            wparams.temperature      = 0.0f;
+            wparams.temperature_inc  = 0.4f;
+            wparams.entropy_thold    = 1.2f;
+            wparams.logprob_thold    = -1.0f;
+            wparams.no_speech_thold  = 0.5f;
+            wparams.max_len          = 40;
 
-    // ★ 改进：多级温度回退策略 + 更细粒度的控制
-    // 依次尝试 0.0(贪婪) → 0.2 → 0.4 → 0.6 → 0.8，用最佳结果
-    wparams.temperature      = 0.0f;
-    wparams.temperature_inc  = 0.4f;         // 更快回退到更高温度，覆盖更广
-    wparams.entropy_thold    = 1.2f;         // ⬇ 从1.5降到1.2，更严格抑制重复文本
-    wparams.logprob_thold    = -1.0f;        // 对数概率阈值
-    wparams.no_speech_thold  = 0.5f;         // ⬇ 从0.6降到0.5，更敏感捕捉语音
-    wparams.max_len          = 40;           // ⬆ 从30提高到40，允许更长的句子
+            wparams.beam_search.beam_size = 7;
 
-    // ★ 改进：Beam search 从 5-beam 提升到 7-beam
-    // 更大的搜索空间显著提升准确率（尤其对长句和同音字），
-    // Apple Silicon GPU 加速下速度影响很小
-    wparams.beam_search.beam_size = 7;
+            const char * chinese_prompt_v2 =
+                "你好世界欢迎使用语音识别系统"
+                "一二三四五六七八九十百千万亿"
+                "今天天气很好请问有什么可以帮助你的"
+                "打开关闭保存删除复制粘贴撤回发送"
+                "他说她说他们说我们在你们他们在"
+                "能不能要不要会不会可以不可以";
 
-    // ★ 改进：更丰富的中文初始提示，帮助模型激活更广泛的中文词汇
-    // 覆盖日常对话、数字、指令等常见场景
-    const char * chinese_prompt_v2 =
-        "你好世界欢迎使用语音识别系统"
-        "一二三四五六七八九十百千万亿"
-        "今天天气很好请问有什么可以帮助你的"
-        "打开关闭保存删除复制粘贴撤回发送"
-        "他说她说他们说我们在你们他们在"
-        "能不能要不要会不会可以不可以";
+            wparams.initial_prompt        = chinese_prompt_v2;
+            wparams.carry_initial_prompt  = false;
+            wparams.audio_ctx             = 0;
+            wparams.tdrz_enable           = false;
 
-    wparams.initial_prompt        = chinese_prompt_v2;
-    wparams.carry_initial_prompt  = false;
-
-    // ★ 改进：音频上下文自动，禁用 token-level 调试
-    wparams.audio_ctx            = 0;         // 自动
-    wparams.tdrz_enable          = false;     // 禁用 token-level 调试
+            whisper_vad_reset_state(vctx);
 
             auto t0 = std::chrono::high_resolution_clock::now();
 
@@ -464,6 +533,8 @@ int main(int argc, char ** argv) {
 
             auto t1 = std::chrono::high_resolution_clock::now();
             double elapsedMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+            std::string asr_text;
 
             if (ret == 0) {
                 const int nSeg = whisper_full_n_segments(ctx);
@@ -478,19 +549,78 @@ int main(int argc, char ** argv) {
                     const char* text = whisper_full_get_segment_text(ctx, i);
                     if (text && text[0] != '\0') {
                         printf("%s", text);
+                        asr_text += text;
                     }
                 }
                 printf("%s\n", COLOR_RESET);
                 printf("%s  └─────────────────────────────────────────────┘%s\n",
                        COLOR_BOLD COLOR_GREEN, COLOR_RESET);
                 printf("\n");
+
+                // ============================================================
+                // ★ 语义理解：将 ASR 结果送入 LLM 处理
+                // ============================================================
+                if (!asr_text.empty()) {
+                    // 移除首尾空白
+                    while (!asr_text.empty() && (asr_text.back() == ' ' || asr_text.back() == '\n'))
+                        asr_text.pop_back();
+                    while (!asr_text.empty() && (asr_text.front() == ' ' || asr_text.front() == '\n'))
+                        asr_text.erase(0, 1);
+
+                    if (looks_like_asr_prompt_artifact(asr_text)) {
+                        printf("%s⚠ [%s] Ignoring non-command/noisy ASR: \"%s\"%s\n",
+                               COLOR_YELLOW, current_time_str().c_str(),
+                               asr_text.c_str(), COLOR_RESET);
+                        goto after_semantic;
+                    }
+
+                    static std::string lastSubmittedText;
+                    static auto lastSubmittedAt = std::chrono::steady_clock::now() - std::chrono::seconds(60);
+                    auto now = std::chrono::steady_clock::now();
+                    if (asr_text == lastSubmittedText &&
+                        now - lastSubmittedAt < std::chrono::seconds(5)) {
+                        printf("%s⚠ [%s] Ignoring duplicate ASR: \"%s\"%s\n",
+                               COLOR_YELLOW, current_time_str().c_str(),
+                               asr_text.c_str(), COLOR_RESET);
+                        goto after_semantic;
+                    }
+                    lastSubmittedText = asr_text;
+                    lastSubmittedAt = now;
+
+                    printf("%s🧠 [%s] Sending to semantic engine: \"%s\"%s\n",
+                           COLOR_MAGENTA, current_time_str().c_str(),
+                           asr_text.c_str(), COLOR_RESET);
+
+                    semanticEngine.process_asr_result(asr_text, [](const Action& action) {
+                        // Action 处理完成后的回调
+                        if (action.type != ActionType::NONE) {
+                            printf("%s⚡ [Action] %s: %s%s\n",
+                                   COLOR_BOLD COLOR_GREEN,
+                                   action.action_name.c_str(),
+                                   action.target.c_str(),
+                                   COLOR_RESET);
+
+                            execute_action(action);
+                        }
+
+                        // 显示 LLM 回复
+                        if (!action.response_text.empty()) {
+                            printf("\n%s🤖 %s%s%s\n",
+                                   COLOR_BOLD COLOR_CYAN, action.response_text.c_str(),
+                                   COLOR_RESET, COLOR_RESET);
+
+                            // ★ TTS 合成由 SemanticEngine 内部自动完成
+                        }
+                    });
+                }
+            after_semantic:
+                ;
             } else {
                 printf("%s❌ [%s] Transcription failed (ret=%d)%s\n",
                        COLOR_RED, current_time_str().c_str(), ret, COLOR_RESET);
             }
 
             // 重置 VAD 状态和所有变量
-            whisper_vad_reset_state(vctx);
             speechBuffer.clear();
             speechFrames = 0;
             silenceFrames = 0;
@@ -499,11 +629,10 @@ int main(int argc, char ** argv) {
             printf("%s──────────────────────────────────────────────────%s\n",
                    COLOR_CYAN, COLOR_RESET);
         }
-        // end do_transcribe
     }
 
     // ============================================================
-    // 5. 清理
+    // 6. 清理
     // ============================================================
     printf("\n%s[%s] Shutting down...%s\n", COLOR_YELLOW, current_time_str().c_str(), COLOR_RESET);
     printf("%s[%s] Total detections: %d, transcriptions: %d%s\n",
@@ -511,6 +640,7 @@ int main(int argc, char ** argv) {
     recorder.stop();
     whisper_vad_free(vctx);
     whisper_free(ctx);
+    semanticEngine.shutdown();
 
     return 0;
 }
