@@ -107,7 +107,7 @@ int main(int argc, char ** argv) {
     // 抑制 whisper VAD 内部 debug 日志
     whisper_log_set(cb_log_disable, nullptr);
 
-    std::string modelPath    = "models/ggml-base.bin";
+    std::string modelPath    = "models/ggml-medium.bin";
     std::string vadModelPath = "models/ggml-silero-v6.2.0.bin";
 
     if (argc > 1) modelPath    = argv[1];
