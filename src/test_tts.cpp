@@ -18,13 +18,13 @@ int main(int argc, char** argv) {
     fprintf(stdout, "  TTS Standalone Test\n");
     fprintf(stdout, "========================================\n");
 
-    // 从环境变量读取配置；未设置时使用本机默认 CosyVoice 部署路径
-    const char* model_dir      = std::getenv("COSYVOICE_MODEL_DIR");
-    const char* python_home    = std::getenv("COSYVOICE_PYTHON_HOME");
-    const char* bridge_dir     = std::getenv("COSYVOICE_BRIDGE_DIR");
+    // 从环境变量读取配置；未设置时使用默认 Qwen3-TTS 0.6B MLX 模型
+    const char* model_dir      = std::getenv("QWEN_TTS_MODEL");
+    const char* python_home    = std::getenv("QWEN_TTS_PYTHON_HOME");
+    const char* bridge_dir     = std::getenv("QWEN_TTS_BRIDGE_DIR");
 
     if (!model_dir) {
-        model_dir = "/Users/boby/Documents/Codex/2026-05-20/gemma4/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B";
+        model_dir = "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16";
     }
     if (!python_home) {
         python_home = "/opt/homebrew/Caskroom/miniforge/base/envs/cosyvoice";
@@ -36,19 +36,25 @@ int main(int argc, char** argv) {
     fprintf(stdout, "[TEST] model_dir:       %s\n", model_dir);
     fprintf(stdout, "[TEST] python_home:     %s\n", python_home);
     fprintf(stdout, "[TEST] bridge_dir:      %s\n", bridge_dir);
+    int sample_rate = 24000;
+    if (const char* env_sample_rate = std::getenv("TTS_SAMPLE_RATE")) {
+        int configured_sample_rate = std::atoi(env_sample_rate);
+        if (configured_sample_rate > 0) {
+            sample_rate = configured_sample_rate;
+        }
+    }
 
     // ── Step 1: 测试 AudioPlayer 独立播放（播放一个纯音） ──
     fprintf(stdout, "\n--- Step 0: AudioPlayer playback test ---\n");
     {
         AudioPlayer player;
-        if (!player.init(22050)) {
+        if (!player.init(sample_rate)) {
             fprintf(stderr, "[FAIL] AudioPlayer init failed!\n");
             return 1;
         }
         fprintf(stdout, "[PASS] AudioPlayer initialized\n");
 
         // 生成一个 440Hz 正弦波，持续 2 秒，音量较大
-        const int sample_rate = 22050;
         const float duration_sec = 2.0f;
         const float freq_hz = 440.0f;  // A4 note
         const int n_samples = static_cast<int>(sample_rate * duration_sec);
@@ -114,9 +120,9 @@ int main(int argc, char** argv) {
         }
         double avg_abs = sum / pcm.size();
 
-        float duration_ms = (float)pcm.size() * 1000.0f / 22050.0f;
+        float duration_ms = (float)pcm.size() * 1000.0f / (float)sample_rate;
         fprintf(stdout, "[PASS] Synthesized %zu samples (%.0f ms, %dHz)\n",
-                pcm.size(), duration_ms, 22050);
+                pcm.size(), duration_ms, sample_rate);
         fprintf(stdout, "       PCM stats: min=%d max=%d avg_abs=%.1f nonzero=%d/%zu (%.1f%%)\n",
                 min_val, max_val, avg_abs, nonzero, pcm.size(),
                 (float)nonzero * 100.0f / pcm.size());
@@ -126,7 +132,7 @@ int main(int argc, char** argv) {
 
         // 每次测试重新创建 AudioPlayer（避免前面播放器已 stop/dispose 问题）
         AudioPlayer player;
-        if (!player.init(22050)) {
+        if (!player.init(sample_rate)) {
             fprintf(stderr, "[FAIL] AudioPlayer init failed!\n");
             continue;
         }

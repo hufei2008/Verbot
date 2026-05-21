@@ -11,16 +11,16 @@
 #include <functional>
 
 // ============================================================
-// TtsEngine — Embedded Python CosyVoice TTS Engine
+// TtsEngine — Embedded Python TTS Engine
 //
-// 将 CosyVoice 模型直接嵌入 C++ 进程内部：
+// 将本地 TTS 模型直接嵌入 C++ 进程内部：
 //   - 使用 Embedded Python 解释器加载 cosyvoice_bridge.py
 //   - 进程启动时加载模型一次，常驻内存
 //   - synthesize() 直接调用 Python 侧函数返回 numpy 数组
 //   - 零网络开销，零进程间通信
 //
 // 依赖：
-//   - conda env: cosyvoice (Python 3.10 + torch + cosyvoice)
+//   - conda env: cosyvoice (Python 3.10 + mlx-audio + numpy)
 //   - CMake 链接: /path/to/libpython3.10.dylib
 //
 // 线程安全：
@@ -41,8 +41,8 @@ public:
     // 初始化
     // ──────────────────────────────────────────────────────
 
-    /// 初始化嵌入式 Python 解释器并加载 CosyVoice 模型。
-    /// @param cosyvoice_model_dir CosyVoice 模型路径（本地路径）
+    /// 初始化嵌入式 Python 解释器并加载 TTS 模型。
+    /// @param cosyvoice_model_dir TTS 模型路径或 Hugging Face model id
     /// @param python_home         conda Python 环境路径（如 /opt/.../envs/cosyvoice）
     /// @param bridge_script_dir   cosyvoice_bridge.py 所在目录
     /// @return true 成功
@@ -125,6 +125,7 @@ private:
     // Python 解释器状态
     bool m_python_initialized{false};
     bool m_python_gil_released{false};
+    void* m_python_main_thread_state{nullptr};  // PyThreadState*
     void* m_py_bridge_module{nullptr};  // PyObject* (cosyvoice_bridge module)
 };
 

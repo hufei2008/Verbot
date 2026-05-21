@@ -36,10 +36,10 @@ add_subdirectory(vendor/llama.cpp)
 add_subdirectory(vendor/whisper.cpp)
 
 # ════════════════════════════════════════
-# 3. CosyVoice Embedded Python 路径
+# 3. TTS Embedded Python 路径
 # ════════════════════════════════════════
-# conda env: cosyvoice (Python 3.10, torch, numpy)
-set(COSYVOICE_PYTHON_PREFIX "/opt/homebrew/Caskroom/miniforge/base/envs/cosyvoice")
+# conda env: cosyvoice (Python 3.10, numpy, mlx-audio)
+set(TTS_PYTHON_PREFIX "/opt/homebrew/Caskroom/miniforge/base/envs/cosyvoice")
 
 # ════════════════════════════════════════
 # 4. ASR 主程序 (含语义理解 + TTS)
@@ -66,8 +66,8 @@ target_include_directories(asr_demo PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/vendor/whisper.cpp/include
     ${CMAKE_SOURCE_DIR}/vendor/llama.cpp/include
-    ${COSYVOICE_PYTHON_PREFIX}/include/python3.10
-    ${COSYVOICE_PYTHON_PREFIX}/lib/python3.10/site-packages/numpy/core/include
+    ${TTS_PYTHON_PREFIX}/include/python3.10
+    ${TTS_PYTHON_PREFIX}/lib/python3.10/site-packages/numpy/core/include
 )
 
 target_link_libraries(asr_demo PRIVATE
@@ -75,7 +75,7 @@ target_link_libraries(asr_demo PRIVATE
     llama
     ${AUDIO_TOOLBOX}
     ${AUDIO_UNIT}
-    ${COSYVOICE_PYTHON_PREFIX}/lib/libpython3.10.dylib
+    ${TTS_PYTHON_PREFIX}/lib/libpython3.10.dylib
 )
 
 # 复制 Python bridge 脚本到构建目录
@@ -120,13 +120,13 @@ target_include_directories(test_tts PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/vendor/whisper.cpp/include
     ${CMAKE_SOURCE_DIR}/vendor/llama.cpp/include
-    ${COSYVOICE_PYTHON_PREFIX}/include/python3.10
-    ${COSYVOICE_PYTHON_PREFIX}/lib/python3.10/site-packages/numpy/core/include
+    ${TTS_PYTHON_PREFIX}/include/python3.10
+    ${TTS_PYTHON_PREFIX}/lib/python3.10/site-packages/numpy/core/include
 )
 
 target_link_libraries(test_tts PRIVATE
     ${AUDIO_TOOLBOX}
-    ${COSYVOICE_PYTHON_PREFIX}/lib/libpython3.10.dylib
+    ${TTS_PYTHON_PREFIX}/lib/libpython3.10.dylib
 )
 
 # 复制 Python bridge 脚本到构建目录

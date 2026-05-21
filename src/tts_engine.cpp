@@ -1,6 +1,7 @@
 #include "tts_engine.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -8,11 +9,11 @@
 #include <Python.h>
 
 // ============================================================
-// TtsEngine — Embedded Python CosyVoice TTS Engine
+// TtsEngine — Embedded Python TTS Engine
 //
 // 核心：使用 CPython 嵌入式 API 在 C++ 进程内运行 Python 代码
 // - Py_Initialize() 启动解释器
-// - cosyvoice_bridge.py 加载 CosyVoice 模型
+// - cosyvoice_bridge.py 加载本地 TTS 模型
 // - PyObject_CallFunction 调用 Python 函数
 // - 通过 numpy C API 直接读取数组内存
 // ============================================================
@@ -30,14 +31,15 @@ TtsEngine::~TtsEngine() {
     }
 
     if (m_python_initialized && Py_IsInitialized()) {
-        PyGILState_STATE gstate = PyGILState_Ensure();
-
-        if (m_py_bridge_module) {
-            Py_DECREF(static_cast<PyObject*>(m_py_bridge_module));
-            m_py_bridge_module = nullptr;
+        // MLX-Audio / Hugging Face can leave Python runtime resources alive.
+        // Restore the main thread state and keep the GIL held for process
+        // shutdown; otherwise Python/MLX atexit handlers can touch Python
+        // state while the GIL is released.
+        if (m_python_gil_released && m_python_main_thread_state) {
+            PyEval_RestoreThread(static_cast<PyThreadState*>(m_python_main_thread_state));
+            m_python_main_thread_state = nullptr;
         }
-
-        Py_Finalize();
+        m_py_bridge_module = nullptr;
         m_python_initialized = false;
         m_python_gil_released = false;
     } else if (m_py_bridge_module) {
@@ -69,7 +71,7 @@ bool TtsEngine::init(const std::string& cosyvoice_model_dir,
         return false;
     }
 
-    // 2. 加载 bridge 模块并初始化 CosyVoice 模型
+    // 2. 加载 bridge 模块并初始化 TTS 模型
     if (!load_bridge_module()) {
         fprintf(stderr, "[TtsEngine] Load bridge module failed!\n");
         return false;
@@ -114,8 +116,8 @@ bool TtsEngine::ensure_python_initialized() {
         return true;
     }
 
-    // 设置 Python 环境路径，指向 conda cosyvoice 环境
-    // 这样 import 时能找到 numpy, torch, cosyvoice 等
+    // 设置 Python 环境路径，指向 TTS conda 环境
+    // 这样 import 时能找到 numpy, mlx_audio 等
 #ifdef Py_SetPythonHome
     Py_SetPythonHome(const_cast<char*>(m_python_home.c_str()));
 #endif
@@ -138,16 +140,6 @@ bool TtsEngine::ensure_python_initialized() {
          "sys.executable = '" + python_exe + "'\n"
          "multiprocessing.set_executable('" + python_exe + "')\n").c_str());
 
-    // 可选: 添加 CosyVoice 源码路径（如果 bridge 脚本找不到）
-    std::string cosyvoice_src = "/Users/boby/Documents/Codex/2026-05-20/gemma4/CosyVoice";
-    PyRun_SimpleString(("import sys; sys.path.insert(0, '" +
-                        cosyvoice_src + "')").c_str());
-
-    // 添加 Matcha-TTS 路径
-    std::string matcha_tts = cosyvoice_src + "/third_party/Matcha-TTS";
-    PyRun_SimpleString(("import sys; sys.path.insert(0, '" +
-                        matcha_tts + "')").c_str());
-
     // 验证关键模块可导入
     int ret = PyRun_SimpleString(
         "try:\n"
@@ -159,9 +151,9 @@ bool TtsEngine::ensure_python_initialized() {
     (void)ret;
 
     m_python_initialized = true;
-    PyEval_SaveThread();
+    m_python_main_thread_state = PyEval_SaveThread();
     m_python_gil_released = true;
-    fprintf(stdout, "[TtsEngine] Python interpreter initialized (conda cosyvoice)\n");
+    fprintf(stdout, "[TtsEngine] Python interpreter initialized for local TTS\n");
     return true;
 }
 
@@ -254,8 +246,15 @@ bool TtsEngine::synthesize_sync(const std::string& text,
     PyGILState_Release(gstate);
 
     if (!out_pcm.empty()) {
+        int sample_rate = 24000;
+        if (const char* env_sample_rate = std::getenv("TTS_SAMPLE_RATE")) {
+            int configured_sample_rate = std::atoi(env_sample_rate);
+            if (configured_sample_rate > 0) {
+                sample_rate = configured_sample_rate;
+            }
+        }
         fprintf(stdout, "[TtsEngine] Synthesized %zu samples (%zu ms)\n",
-                out_pcm.size(), out_pcm.size() * 1000 / 22050);
+                out_pcm.size(), out_pcm.size() * 1000 / (size_t)sample_rate);
     } else {
         fprintf(stderr, "[TtsEngine] Empty synthesis result!\n");
         return false;
@@ -350,8 +349,15 @@ bool TtsEngine::synthesize_stream(const std::string& text,
     PyGILState_Release(gstate);
 
     if (ok) {
+        int sample_rate = 24000;
+        if (const char* env_sample_rate = std::getenv("TTS_SAMPLE_RATE")) {
+            int configured_sample_rate = std::atoi(env_sample_rate);
+            if (configured_sample_rate > 0) {
+                sample_rate = configured_sample_rate;
+            }
+        }
         fprintf(stdout, "[TtsEngine] Stream synthesized %zu samples in %d chunks (%.2f sec)\n",
-                total_samples, chunk_count, (double)total_samples / 22050.0);
+                total_samples, chunk_count, (double)total_samples / (double)sample_rate);
     } else {
         fprintf(stderr, "[TtsEngine] Stream synthesis failed or interrupted after %zu samples\n",
                 total_samples);

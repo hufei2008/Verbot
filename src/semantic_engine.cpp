@@ -188,27 +188,27 @@ bool SemanticEngine::init(const std::string& model_path,
         return false;
     }
 
-    // 4. 初始化 TTS 引擎（嵌入式 CosyVoice）
+    // 4. 初始化 TTS 引擎（嵌入式 Qwen3-TTS / MLX-Audio）
     {
-        const char* env_model_dir = std::getenv("COSYVOICE_MODEL_DIR");
-        const char* env_python_home = std::getenv("COSYVOICE_PYTHON_HOME");
-        const char* env_bridge_dir = std::getenv("COSYVOICE_BRIDGE_DIR");
+        const char* env_model_dir = std::getenv("QWEN_TTS_MODEL");
+        const char* env_python_home = std::getenv("QWEN_TTS_PYTHON_HOME");
+        const char* env_bridge_dir = std::getenv("QWEN_TTS_BRIDGE_DIR");
 
-        std::string cosyvoice_model_dir = env_model_dir
+        std::string tts_model_dir = env_model_dir
             ? env_model_dir
-            : "/Users/boby/Documents/Codex/2026-05-20/gemma4/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B";
-        std::string cosyvoice_python_home = env_python_home
+            : "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16";
+        std::string tts_python_home = env_python_home
             ? env_python_home
             : "/opt/homebrew/Caskroom/miniforge/base/envs/cosyvoice";
-        std::string cosyvoice_bridge_dir = env_bridge_dir
+        std::string tts_bridge_dir = env_bridge_dir
             ? env_bridge_dir
             : "/Users/boby/work/study2/python";
 
-        if (init_tts(cosyvoice_model_dir, cosyvoice_python_home, cosyvoice_bridge_dir)) {
-            fprintf(stdout, "[SemanticEngine] TTS engine initialized (Embedded CosyVoice)\n");
+        if (init_tts(tts_model_dir, tts_python_home, tts_bridge_dir)) {
+            fprintf(stdout, "[SemanticEngine] TTS engine initialized (Embedded Qwen3-TTS)\n");
         } else {
             fprintf(stderr, "[SemanticEngine] TTS engine init failed (non-fatal). "
-                    "Set COSYVOICE_MODEL_DIR, COSYVOICE_PYTHON_HOME, COSYVOICE_BRIDGE_DIR if your paths differ.\n");
+                    "Set QWEN_TTS_MODEL, QWEN_TTS_PYTHON_HOME, QWEN_TTS_BRIDGE_DIR if your paths differ.\n");
         }
     }
 
@@ -381,7 +381,7 @@ void SemanticEngine::default_action_handler(const Action& action) {
 }
 
 // ============================================================================
-// TTS — Embedded Python + CosyVoice
+// TTS — Embedded Python + Qwen3-TTS
 // ============================================================================
 
 bool SemanticEngine::init_tts(const std::string& model_dir,
@@ -392,8 +392,16 @@ bool SemanticEngine::init_tts(const std::string& model_dir,
         return false;
     }
 
-    // 初始化音频播放器（macOS AudioUnit）
-    if (!m_audio_player.init()) {
+    m_tts_sample_rate = 24000;
+    if (const char* env_sample_rate = std::getenv("TTS_SAMPLE_RATE")) {
+        int configured_sample_rate = std::atoi(env_sample_rate);
+        if (configured_sample_rate > 0) {
+            m_tts_sample_rate = configured_sample_rate;
+        }
+    }
+
+    // 初始化音频播放器（macOS AudioQueue）
+    if (!m_audio_player.init(m_tts_sample_rate)) {
         fprintf(stderr, "[TTS] AudioPlayer init failed\n");
         return false;
     }
@@ -425,7 +433,7 @@ void SemanticEngine::speak(const std::string& text, const std::string& spk_id) {
         m_tts_active_jobs++;
     }
 
-    // 在独立线程中播放，不阻塞 LLM 推理；串行化 CosyVoice/Python 调用和 AudioQueue 播放
+    // 在独立线程中播放，不阻塞 LLM 推理；串行化 Python TTS 调用和 AudioQueue 播放
     std::thread([this, text, spk_id]() {
         {
             std::lock_guard<std::mutex> serial_lock(m_tts_serial_mutex);
@@ -438,15 +446,15 @@ void SemanticEngine::speak(const std::string& text, const std::string& spk_id) {
             bool playback_started = false;
             std::vector<int16_t> pending_pcm;
 
-            double start_buffer_sec = 2.5;
-            if (const char* env_buffer = std::getenv("COSYVOICE_STREAM_START_BUFFER_SEC")) {
+            double start_buffer_sec = 0.35;
+            if (const char* env_buffer = std::getenv("TTS_STREAM_START_BUFFER_SEC")) {
                 try {
                     start_buffer_sec = std::max(0.0, std::atof(env_buffer));
                 } catch (...) {
-                    start_buffer_sec = 2.5;
+                    start_buffer_sec = 0.35;
                 }
             }
-            const size_t start_buffer_samples = (size_t)(start_buffer_sec * 22050.0);
+            const size_t start_buffer_samples = (size_t)(start_buffer_sec * (double)m_tts_sample_rate);
 
             auto start_playback = [&]() {
                 if (playback_started || pending_pcm.empty()) return;
@@ -454,7 +462,7 @@ void SemanticEngine::speak(const std::string& text, const std::string& spk_id) {
                 m_audio_player.play(pending_pcm);
                 playback_started = true;
                 fprintf(stdout, "[TTS] Playback started after buffering %.2f sec (%zu samples)\n",
-                        (double)pending_pcm.size() / 22050.0, pending_pcm.size());
+                        (double)pending_pcm.size() / (double)m_tts_sample_rate, pending_pcm.size());
                 pending_pcm.clear();
             };
 
@@ -465,7 +473,7 @@ void SemanticEngine::speak(const std::string& text, const std::string& spk_id) {
                     total_samples += pcm.size();
                     chunk_count++;
                     fprintf(stdout, "[TTS] Streaming chunk #%d: %zu samples (total %.2f sec)\n",
-                            chunk_count, pcm.size(), (double)total_samples / 22050.0);
+                            chunk_count, pcm.size(), (double)total_samples / (double)m_tts_sample_rate);
 
                     if (!playback_started) {
                         pending_pcm.insert(pending_pcm.end(), pcm.begin(), pcm.end());
@@ -485,7 +493,7 @@ void SemanticEngine::speak(const std::string& text, const std::string& spk_id) {
             m_audio_player.finish_stream();
             if (ok) {
                 fprintf(stdout, "[TTS] Stream playback queued: %zu samples in %d chunks (%.2f sec)\n",
-                        total_samples, chunk_count, (double)total_samples / 22050.0);
+                        total_samples, chunk_count, (double)total_samples / (double)m_tts_sample_rate);
                 m_audio_player.wait_for_finish();
             } else {
                 fprintf(stderr, "[TTS] Stream synthesis failed for: \"%s\"\n", text.c_str());

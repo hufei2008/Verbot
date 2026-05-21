@@ -99,7 +99,7 @@ private:
     // TTS 内部方法
     // ──────────────────────────────────────────────────────
 
-    /// 初始化 TTS 引擎（嵌入式 CosyVoice）
+    /// 初始化 TTS 引擎（嵌入式 Python TTS bridge）
     bool init_tts(const std::string& model_dir,
                   const std::string& python_home,
                   const std::string& bridge_script_dir);
@@ -144,6 +144,7 @@ private:
     AudioPlayer            m_audio_player;
     bool                   m_tts_initialized{false};
     bool                   m_auto_speak{true};     // 自动朗读回复
+    int                    m_tts_sample_rate{24000};
     std::string            m_default_spk_id{"中文女"};
     mutable std::mutex     m_tts_mutex;
     std::condition_variable m_tts_cv;
