@@ -63,8 +63,6 @@ add_executable(Verbot
     src/audio_player.h
 )
 
-set_target_properties(Verbot PROPERTIES OUTPUT_NAME asr_demo)
-
 target_include_directories(Verbot PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/vendor/whisper.cpp/include
@@ -83,6 +81,13 @@ target_link_libraries(Verbot PRIVATE
 )
 
 # 复制 Python bridge 脚本到构建目录
+add_custom_command(TARGET Verbot POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E create_symlink
+        $<TARGET_FILE_NAME:Verbot>
+        $<TARGET_FILE_DIR:Verbot>/asr_demo
+    COMMENT "Creating asr_demo compatibility symlink"
+)
+
 add_custom_command(TARGET Verbot POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${CMAKE_SOURCE_DIR}/python

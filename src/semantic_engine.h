@@ -13,6 +13,7 @@
 #include <memory>
 #include <vector>
 #include <cstdint>
+#include <atomic>
 
 // ============================================================
 // 语义引擎
@@ -157,6 +158,7 @@ private:
     std::condition_variable m_tts_cv;
     int                    m_tts_active_jobs{0};
     std::mutex             m_tts_serial_mutex;
+    std::atomic<uint64_t>  m_tts_generation{0};
 };
 
 #endif // SEMANTIC_ENGINE_H

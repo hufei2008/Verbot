@@ -42,6 +42,9 @@ public:
     // 停止播放并清空队列
     void stop();
 
+    // 中断当前播放但保留 AudioQueue，供下一段 TTS 立即复用
+    void interrupt();
+
     // 暂停
     void pause();
 

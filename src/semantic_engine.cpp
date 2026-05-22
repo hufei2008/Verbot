@@ -456,7 +456,9 @@ bool SemanticEngine::init(const std::string& model_path,
             : "/Users/boby/work/study2/python";
 
         if (init_tts(tts_model_dir, tts_python_home, tts_bridge_dir)) {
-            fprintf(stdout, "[SemanticEngine] TTS engine initialized (Embedded Qwen3-TTS)\n");
+            const char* backend = std::getenv("TTS_BACKEND");
+            fprintf(stdout, "[SemanticEngine] TTS engine initialized (%s)\n",
+                    backend ? backend : "macos");
         } else {
             fprintf(stderr, "[SemanticEngine] TTS engine init failed (non-fatal). "
                     "Set QWEN_TTS_MODEL, QWEN_TTS_PYTHON_HOME, QWEN_TTS_BRIDGE_DIR if your paths differ.\n");
@@ -766,15 +768,24 @@ bool SemanticEngine::synthesize_text(const std::string& text,
 }
 
 void SemanticEngine::speak(const std::string& text, const std::string& spk_id) {
+    const uint64_t generation = ++m_tts_generation;
+    m_audio_player.interrupt();
+
     {
         std::lock_guard<std::mutex> lock(m_tts_mutex);
         m_tts_active_jobs++;
     }
 
     // 在独立线程中播放，不阻塞 LLM 推理；串行化 Python TTS 调用和 AudioQueue 播放
-    std::thread([this, text, spk_id]() {
+    std::thread([this, text, spk_id, generation]() {
         {
             std::lock_guard<std::mutex> serial_lock(m_tts_serial_mutex);
+            if (generation != m_tts_generation.load()) {
+                std::lock_guard<std::mutex> lock(m_tts_mutex);
+                m_tts_active_jobs--;
+                m_tts_cv.notify_all();
+                return;
+            }
 
             fprintf(stdout, "[TTS] Streaming reply: \"%s\"\n", text.c_str());
 
@@ -806,8 +817,12 @@ void SemanticEngine::speak(const std::string& text, const std::string& spk_id) {
 
             bool ok = m_tts_engine.synthesize_stream(text, spk_id,
                 [this, &total_samples, &buffered_samples, &chunk_count,
-                 &pending_pcm, &playback_started, start_buffer_samples, &start_playback]
+                 &pending_pcm, &playback_started, start_buffer_samples, &start_playback,
+                 generation]
                 (const std::vector<int16_t>& pcm) {
+                    if (generation != m_tts_generation.load()) {
+                        return false;
+                    }
                     total_samples += pcm.size();
                     chunk_count++;
                     fprintf(stdout, "[TTS] Streaming chunk #%d: %zu samples (total %.2f sec)\n",
@@ -838,7 +853,11 @@ void SemanticEngine::speak(const std::string& text, const std::string& spk_id) {
                 }
                 m_audio_player.wait_for_finish(wait_timeout_ms);
             } else {
-                fprintf(stderr, "[TTS] Stream synthesis failed for: \"%s\"\n", text.c_str());
+                if (generation != m_tts_generation.load()) {
+                    fprintf(stdout, "[TTS] Stream interrupted by newer reply: \"%s\"\n", text.c_str());
+                } else {
+                    fprintf(stderr, "[TTS] Stream synthesis failed for: \"%s\"\n", text.c_str());
+                }
             }
         }
 

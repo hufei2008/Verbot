@@ -301,6 +301,22 @@ void AudioPlayer::stop() {
     fprintf(stdout, "[AudioPlayer] Stopped and disposed\n");
 }
 
+void AudioPlayer::interrupt() {
+    if (!m_initialized) return;
+
+    AudioQueueRef queue = static_cast<AudioQueueRef>(m_queue);
+    AudioQueueStop(queue, true);
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_playback_buffer.clear();
+    }
+
+    m_streaming = false;
+    m_playing = false;
+    m_cv.notify_all();
+}
+
 void AudioPlayer::pause() {
     if (!m_initialized || !m_playing) return;
     AudioQueueRef queue = static_cast<AudioQueueRef>(m_queue);

@@ -246,12 +246,15 @@ int main(int argc, char ** argv) {
 
     // TTS 状态
     if (semanticEngine.tts_ready()) {
-        printf("%s[%s] TTS ready (Embedded Qwen3-TTS via Python bridge)%s\n",
-               COLOR_GREEN, current_time_str().c_str(), COLOR_RESET);
+        const char* ttsBackend = std::getenv("TTS_BACKEND");
+        printf("%s[%s] TTS ready (%s backend via Python bridge)%s\n",
+               COLOR_GREEN, current_time_str().c_str(),
+               ttsBackend ? ttsBackend : "macos", COLOR_RESET);
     } else {
         printf("%s[%s] TTS not available. "
                "To enable, set:\n"
-               "  export QWEN_TTS_MODEL=mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16\n"
+               "  export TTS_BACKEND=macos\n"
+               "  export MACOS_TTS_VOICE=Tingting\n"
                "  export QWEN_TTS_PYTHON_HOME=/path/to/conda/envs/cosyvoice\n"
                "  export QWEN_TTS_BRIDGE_DIR=/path/to/study2/python%s\n",
                COLOR_YELLOW, current_time_str().c_str(), COLOR_RESET);
