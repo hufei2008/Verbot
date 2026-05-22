@@ -35,8 +35,9 @@ public:
     void start_stream();
     void finish_stream();
 
-    // 等待播放完成（阻塞）
-    void wait_for_finish();
+    // 等待播放完成（阻塞），最多等待 timeout_ms 毫秒
+    // 返回 true 表示播放已完成，false 表示超时
+    bool wait_for_finish(int timeout_ms = 30000);
 
     // 停止播放并清空队列
     void stop();

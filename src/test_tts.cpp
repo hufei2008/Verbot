@@ -8,6 +8,7 @@
 #include <vector>
 #include <thread>
 #include <chrono>
+#include <unistd.h>
 
 // ============================================================
 // TTS 独立测试
@@ -143,9 +144,32 @@ int main(int argc, char** argv) {
         fprintf(stdout, "[PASS] Playback finished\n\n");
     }
 
+    fprintf(stdout, "\n--- Step 4: Streaming TTS repeat test ---\n");
+    const char* stream_texts[] = {
+        "好的，我已经准备好了。",
+        "第二次流式合成测试。"
+    };
+    for (int i = 0; i < 2; ++i) {
+        size_t total_samples = 0;
+        int chunks = 0;
+        bool ok = tts.synthesize_stream(stream_texts[i], "中文女",
+            [&](const std::vector<int16_t>& pcm) {
+                total_samples += pcm.size();
+                chunks++;
+                return true;
+            });
+        if (!ok || total_samples == 0) {
+            fprintf(stderr, "[FAIL] Stream synthesis failed for: %s\n", stream_texts[i]);
+            return 1;
+        }
+        fprintf(stdout, "[PASS] Stream %d: %d chunks, %zu samples\n",
+                i + 1, chunks, total_samples);
+    }
+
     fprintf(stdout, "========================================\n");
     fprintf(stdout, "  TTS Test Complete!\n");
     fprintf(stdout, "========================================\n");
 
-    return 0;
+    fflush(nullptr);
+    _exit(0);
 }

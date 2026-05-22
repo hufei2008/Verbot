@@ -159,7 +159,20 @@ void AudioPlayer::play(const std::vector<int16_t>& data) {
 }
 
 void AudioPlayer::start_stream() {
+    if (!m_initialized) return;
+
+    if (m_playing) {
+        AudioQueueStop(static_cast<AudioQueueRef>(m_queue), true);
+        m_playing = false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_playback_buffer.clear();
+    }
+
     m_streaming = true;
+    m_cv.notify_all();
 }
 
 void AudioPlayer::finish_stream() {
@@ -223,17 +236,32 @@ void AudioPlayer::fill_buffer(void* buffer_ptr) {
     }
 }
 
-void AudioPlayer::wait_for_finish() {
-    if (!m_playing) return;
+bool AudioPlayer::wait_for_finish(int timeout_ms) {
+    if (!m_playing) return true;
 
     std::unique_lock<std::mutex> lock(m_mutex);
-    m_cv.wait_for(lock, std::chrono::seconds(30), [this]() {
+    bool finished = m_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this]() {
         return !m_playing;
     });
 
-    // 等待 AudioQueue 真正播完最后一个 buffer
-    lock.unlock();
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    if (finished) {
+        // 等待 AudioQueue 真正播完最后一个 buffer
+        lock.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    } else {
+        lock.unlock();
+        fprintf(stderr, "[AudioPlayer] wait_for_finish timed out after %dms, forcing stop\n",
+                timeout_ms);
+        AudioQueueStop(static_cast<AudioQueueRef>(m_queue), true);
+        {
+            std::lock_guard<std::mutex> lock2(m_mutex);
+            m_playback_buffer.clear();
+        }
+        m_streaming = false;
+        m_playing = false;
+        m_cv.notify_all();
+    }
+    return finished;
 }
 
 void AudioPlayer::stop() {

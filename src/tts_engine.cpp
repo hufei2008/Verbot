@@ -30,21 +30,56 @@ TtsEngine::~TtsEngine() {
         m_worker.join();
     }
 
-    if (m_python_initialized && Py_IsInitialized()) {
-        // MLX-Audio / Hugging Face can leave Python runtime resources alive.
-        // Restore the main thread state and keep the GIL held for process
-        // shutdown; otherwise Python/MLX atexit handlers can touch Python
-        // state while the GIL is released.
-        if (m_python_gil_released && m_python_main_thread_state) {
-            PyEval_RestoreThread(static_cast<PyThreadState*>(m_python_main_thread_state));
-            m_python_main_thread_state = nullptr;
-        }
-        m_py_bridge_module = nullptr;
-        m_python_initialized = false;
-        m_python_gil_released = false;
-    } else if (m_py_bridge_module) {
-        m_py_bridge_module = nullptr;
+    // 析构函数中不做任何 Python 操作。Python 资源在 shutdown() 中释放，
+    // 必须在 main() 返回前、Python atexit 处理程序执行之前调用。
+}
+
+// ============================================================
+// shutdown — 停止 TTS Engine（不终结 Python 解释器）
+//
+// 只做安全退出所需的最小操作：
+//   1. 停止 C++ 工作线程（不再执行 Python 调用）
+//   2. 清空 Python 指针（标记不可用）
+//
+// 不调用 Py_FinalizeEx() 或任何 Python C API 清理函数。
+// 原因：cosyvoice_bridge、sentencepiece、numpy 等 C 扩展在 Python
+// finalization 阶段（Py_FinalizeEx/exit/return）内部可能创建了
+// 额外的 C/C++ 线程或注册了线程状态，导致 threading._shutdown()
+// 调用 PyThreadState_Get 时 crash。
+//
+// 嵌入式 Python 的推荐做法：让 OS 在进程退出时回收所有资源，
+// 这比手动调用 Py_FinalizeEx() 更安全。
+//
+// main() 调用本函数后必须使用 _exit() 退出进程，跳过 exit()
+// 的 atexit 处理程序和 C++ 析构函数执行链。
+// ============================================================
+
+void TtsEngine::shutdown() {
+    if (!m_python_initialized && !m_py_bridge_module) {
+        return;
     }
+
+    // 停止工作线程
+    if (m_worker.joinable()) {
+        m_running = false;
+        m_cv.notify_one();
+        m_worker.join();
+    }
+
+    // 不调用任何 Python C API 清理函数（包括 Py_FinalizeEx）。
+    // 原因：Python C 扩展（sentencepiece、transformers、numpy 等）
+    // 在 Python finalization 阶段可能创建额外的线程状态或访问
+    // GIL，导致 threading._shutdown() → PyThreadState_Get crash。
+    // multiprocessing.resource_tracker daemon 线程也是问题来源。
+    // 此外，Python 3.10 中 setenv("PYTHONMULTIPROCESSING_RESOURCE_TRACKER","0")
+    // 无效（该 env var 从 Python 3.12 才引入）。
+    //
+    // 安全的做法：让 OS 回收所有资源。
+
+    m_py_bridge_module = nullptr;
+    m_python_main_thread_state = nullptr;
+    m_python_gil_released = false;
+    m_python_initialized = false;
 }
 
 // ============================================================
@@ -94,6 +129,47 @@ bool TtsEngine::init(const std::string& cosyvoice_model_dir,
         PyGILState_Release(gstate);
     }
 
+    // ★ 在 bridge 模块完全加载后，永久禁用 multiprocessing.resource_tracker。
+    //
+    // cosyvoice_bridge 的导入链（transformers → huggingface_hub → filelock
+    // → threading → multiprocessing）可能触发 resource_tracker daemon 线程
+    // 的创建。这个 daemon 线程在后台运行 Python 代码并等待 pipe 输入，
+    // 在主线程释放 GIL 时它可被唤醒，访问 PyThreadState 导致 crash。
+    //
+    // setenv("PYTHONMULTIPROCESSING_RESOURCE_TRACKER","0") 在 Python 3.10
+    // 中无效（该 env var 从 3.12 才被识别）。_stop() 也不可靠，因为：
+    // - 在 _stop() 调用后其他代码又 import multiprocessing 时会重新创建
+    // - daemon 线程退出需要时间，可能仍晚于崩溃发生
+    //
+    // 终极方案（下面实现）：
+    // 1. 停止现有 daemon 线程
+    // 2. 替换 ensure_running() 为 no-op，使 daemon 永远无法启动
+    // 3. 替换 register/unregister 为 no-op
+    // 4. 设置 _resource_tracker = None
+    // 5. 过滤 warnings
+    {
+        PyGILState_STATE gstate = PyGILState_Ensure();
+        PyRun_SimpleString(
+            "import sys\n"
+            "if 'multiprocessing.resource_tracker' in sys.modules:\n"
+            "    import multiprocessing.resource_tracker as _rt\n"
+            "    # 1. 停止现有的 daemon 线程\n"
+            "    if _rt._resource_tracker is not None:\n"
+            "        try:\n"
+            "            _rt._resource_tracker._stop()\n"
+            "        except Exception:\n"
+            "            pass\n"
+            "    # 2. 永久禁用：替换核心函数为 no-op\n"
+            "    _rt.ensure_running = lambda: None\n"
+            "    _rt.register = lambda *a, **kw: None\n"
+            "    _rt.unregister = lambda *a, **kw: None\n"
+            "    _rt._resource_tracker = None\n"
+            "import warnings\n"
+            "warnings.filterwarnings('ignore', message='resource_tracker:.*')\n"
+        );
+        PyGILState_Release(gstate);
+    }
+
     // 4. 启动后台工作线程
     m_running = true;
     m_worker = std::thread(&TtsEngine::worker_loop, this);
@@ -116,6 +192,17 @@ bool TtsEngine::ensure_python_initialized() {
         return true;
     }
 
+    // 在初始化 Python 解释器之前设置环境变量，禁用
+    // multiprocessing.resource_tracker daemon 线程。
+    // bridge 模块（mlx、transformers、sentencepiece 等）可能间接导入
+    // multiprocessing，其 resource_tracker 会创建一个 daemon 线程。
+    // 进程退出时该 daemon 线程仍然会运行，访问 GIL 状态导致
+    // Fatal Python error: PyThreadState_Get crash。
+    // 必须用 C 的 setenv() 在 Py_Initialize() 之前设置，
+    // 因为 Python 启动后 os.environ 设置可能已经太晚。
+    setenv("PYTHONMULTIPROCESSING_RESOURCE_TRACKER", "0", 1);
+    setenv("PYTHONWARNINGS", "ignore:resource_tracker:UserWarning", 0);
+
     // 设置 Python 环境路径，指向 TTS conda 环境
     // 这样 import 时能找到 numpy, mlx_audio 等
 #ifdef Py_SetPythonHome
@@ -136,9 +223,19 @@ bool TtsEngine::ensure_python_initialized() {
 
     std::string python_exe = m_python_home + "/bin/python";
     PyRun_SimpleString(
-        ("import sys, multiprocessing\n"
-         "sys.executable = '" + python_exe + "'\n"
-         "multiprocessing.set_executable('" + python_exe + "')\n").c_str());
+        ("import sys\n"
+         "sys.executable = '" + python_exe + "'\n").c_str());
+
+    // 设置环境变量禁用 multiprocessing.resource_tracker daemon 线程。
+    // bridge 模块（mlx、transformers、sentencepiece 等）可能间接导入
+    // multiprocessing，其 resource_tracker 会创建一个 daemon 线程。
+    // 进程退出时该 daemon 线程仍然会运行，并访问 GIL 状态导致
+    // Fatal Python error: PyThreadState_Get crash。
+    // 环境变量方式比事后 stop() 更可靠，因为它阻止了这个线程的创建。
+    PyRun_SimpleString(
+        "import os\n"
+        "os.environ['PYTHONMULTIPROCESSING_RESOURCE_TRACKER'] = '0'\n"
+    );
 
     // 验证关键模块可导入
     int ret = PyRun_SimpleString(
@@ -150,7 +247,40 @@ bool TtsEngine::ensure_python_initialized() {
     );
     (void)ret;
 
+    // ★ 终结 multiprocessing.resource_tracker 守护线程！
+    //
+    // 这是最关键的一步。Python 3.10 的 multiprocessing 模块
+    // 默认创建一个守护线程（resource_tracker）来跟踪命名信号量。
+    // 这个 daemon 线程在后台运行 Python 代码，当主线程释放 GIL
+    // 时它可能被唤醒，导致 GIL 状态不一致 crash。
+    //
+    // setenv("PYTHONMULTIPROCESSING_RESOURCE_TRACKER","0") 在
+    // Python 3.10 中不起作用（该 env var 从 3.12 才引入），
+    // 所以只能运行时通过 Python 代码来 stop 它。
+    //
+    // 正确做法：
+    // 1. 调用 rt._resource_tracker._stop() 发送停止信号到管道
+    // 2. daemon 线程收到后退出循环
+    // 3. 设置 rt._resource_tracker = None 防止后续重新启动
+    // 4. 抑制 resource_tracker 的警告信息
+    PyRun_SimpleString(
+        "import sys\n"
+        "if 'multiprocessing.resource_tracker' in sys.modules:\n"
+        "    import multiprocessing.resource_tracker as rt\n"
+        "    if rt._resource_tracker is not None:\n"
+        "        try:\n"
+        "            rt._resource_tracker._stop()\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "        rt._resource_tracker = None\n"
+        "import warnings\n"
+        "warnings.filterwarnings('ignore', message='resource_tracker:.*')\n"
+    );
+
     m_python_initialized = true;
+    // 释放主线程持有的 GIL。TTS 合成发生在独立线程里，如果这里不
+    // 释放 GIL，播放线程会卡在 PyGILState_Ensure()，主线程又在
+    // wait_for_tts_for() 等它结束，形成死锁。
     m_python_main_thread_state = PyEval_SaveThread();
     m_python_gil_released = true;
     fprintf(stdout, "[TtsEngine] Python interpreter initialized for local TTS\n");
@@ -197,7 +327,30 @@ bool TtsEngine::synthesize_sync(const std::string& text,
 
     out_pcm.clear();
 
-    PyGILState_STATE gstate = PyGILState_Ensure();
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_cv.wait(lock, [this]() { return !m_has_pending && !m_busy; });
+        m_pending_kind = 1;
+        m_pending_text = text;
+        m_pending_spk_id = spk_id;
+        m_result_pcm.clear();
+        m_request_done = false;
+        m_request_ok = false;
+        m_has_pending = true;
+        m_cancel = false;
+    }
+    m_cv.notify_one();
+
+    std::unique_lock<std::mutex> lock(m_mutex);
+    m_cv.wait(lock, [this]() { return m_request_done; });
+    out_pcm = std::move(m_result_pcm);
+    return m_request_ok;
+}
+
+bool TtsEngine::synthesize_sync_python(const std::string& text,
+                                       std::vector<int16_t>& out_pcm,
+                                       const std::string& spk_id) {
+    out_pcm.clear();
 
     PyObject* bridge = static_cast<PyObject*>(m_py_bridge_module);
 
@@ -208,7 +361,6 @@ bool TtsEngine::synthesize_sync(const std::string& text,
                                            "sft");
     if (!result) {
         PyErr_Print();
-        PyGILState_Release(gstate);
         fprintf(stderr, "[TtsEngine] bridge.synthesize() failed!\n");
         return false;
     }
@@ -218,7 +370,6 @@ bool TtsEngine::synthesize_sync(const std::string& text,
     if (!buffer) {
         PyErr_Print();
         Py_DECREF(result);
-        PyGILState_Release(gstate);
         fprintf(stderr, "[TtsEngine] result.tobytes() call failed!\n");
         return false;
     }
@@ -229,7 +380,6 @@ bool TtsEngine::synthesize_sync(const std::string& text,
     if (PyBytes_AsStringAndSize(buffer, const_cast<char**>(&buf_data), &buf_len) == -1) {
         Py_DECREF(buffer);
         Py_DECREF(result);
-        PyGILState_Release(gstate);
         fprintf(stderr, "[TtsEngine] PyBytes_AsStringAndSize failed!\n");
         return false;
     }
@@ -243,7 +393,6 @@ bool TtsEngine::synthesize_sync(const std::string& text,
 
     Py_DECREF(buffer);
     Py_DECREF(result);
-    PyGILState_Release(gstate);
 
     if (!out_pcm.empty()) {
         int sample_rate = 24000;
@@ -275,8 +424,28 @@ bool TtsEngine::synthesize_stream(const std::string& text,
         return false;
     }
 
-    PyGILState_STATE gstate = PyGILState_Ensure();
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_cv.wait(lock, [this]() { return !m_has_pending && !m_busy; });
+        m_pending_kind = 2;
+        m_pending_text = text;
+        m_pending_spk_id = spk_id;
+        m_pending_stream_callback = std::move(on_chunk);
+        m_request_done = false;
+        m_request_ok = false;
+        m_has_pending = true;
+        m_cancel = false;
+    }
+    m_cv.notify_one();
 
+    std::unique_lock<std::mutex> lock(m_mutex);
+    m_cv.wait(lock, [this]() { return m_request_done; });
+    return m_request_ok;
+}
+
+bool TtsEngine::synthesize_stream_python(const std::string& text,
+                                         const std::string& spk_id,
+                                         TtsStreamChunkCallback on_chunk) {
     PyObject* bridge = static_cast<PyObject*>(m_py_bridge_module);
     PyObject* generator = PyObject_CallMethod(bridge, "synthesize_stream", "(sss)",
                                               text.c_str(),
@@ -284,7 +453,6 @@ bool TtsEngine::synthesize_stream(const std::string& text,
                                               "sft");
     if (!generator) {
         PyErr_Print();
-        PyGILState_Release(gstate);
         fprintf(stderr, "[TtsEngine] bridge.synthesize_stream() failed!\n");
         return false;
     }
@@ -293,7 +461,6 @@ bool TtsEngine::synthesize_stream(const std::string& text,
     Py_DECREF(generator);
     if (!iterator) {
         PyErr_Print();
-        PyGILState_Release(gstate);
         fprintf(stderr, "[TtsEngine] synthesize_stream result is not iterable!\n");
         return false;
     }
@@ -339,14 +506,15 @@ bool TtsEngine::synthesize_stream(const std::string& text,
         Py_DECREF(buffer);
         Py_DECREF(chunk);
 
-        if (!pcm.empty() && !on_chunk(pcm)) {
-            ok = false;
-            break;
+        if (!pcm.empty()) {
+            if (!on_chunk(pcm)) {
+                ok = false;
+                break;
+            }
         }
     }
 
     Py_DECREF(iterator);
-    PyGILState_Release(gstate);
 
     if (ok) {
         int sample_rate = 24000;
@@ -380,6 +548,11 @@ void TtsEngine::synthesize_async(const std::string& text,
 
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_has_pending || m_busy) {
+            if (on_done) on_done(false, text, "TtsEngine busy");
+            return;
+        }
+        m_pending_kind = 3;
         m_pending_text = text;
         m_pending_spk_id = spk_id;
         m_pending_callback = std::move(on_done);
@@ -396,7 +569,7 @@ void TtsEngine::synthesize_async(const std::string& text,
 
 void TtsEngine::wait_for_done() {
     std::unique_lock<std::mutex> lock(m_mutex);
-    m_cv.wait(lock, [this]() { return !m_has_pending; });
+    m_cv.wait(lock, [this]() { return !m_has_pending && !m_busy; });
 }
 
 void TtsEngine::cancel() {
@@ -414,10 +587,15 @@ bool TtsEngine::is_busy() const {
 // ============================================================
 
 void TtsEngine::worker_loop() {
+    PyGILState_STATE worker_gstate = PyGILState_Ensure();
+    (void)worker_gstate;
+
     while (m_running) {
         std::string text;
         std::string spk_id;
         TtsEngineDoneCallback callback;
+        TtsStreamChunkCallback stream_callback;
+        int kind = 0;
 
         // 等待任务
         {
@@ -430,21 +608,33 @@ void TtsEngine::worker_loop() {
             if (m_cancel) {
                 m_has_pending = false;
                 m_cancel = false;
+                m_request_done = true;
+                m_request_ok = false;
+                m_cv.notify_all();
                 continue;
             }
 
+            kind = m_pending_kind;
             text = m_pending_text;
             spk_id = m_pending_spk_id;
             callback = std::move(m_pending_callback);
+            stream_callback = std::move(m_pending_stream_callback);
             m_has_pending = false;
+            m_busy = true;
         }
 
-        m_busy = true;
-
-        fprintf(stdout, "[TtsEngine] Async synthesizing: \"%s\"\n", text.c_str());
-
+        bool ok = false;
         std::vector<int16_t> pcm;
-        bool ok = synthesize_sync(text, pcm, spk_id);
+
+        if (kind == 2) {
+            fprintf(stdout, "[TtsEngine] Worker streaming: \"%s\"\n", text.c_str());
+            ok = synthesize_stream_python(text, spk_id, stream_callback);
+        } else {
+            if (kind == 3) {
+                fprintf(stdout, "[TtsEngine] Async synthesizing: \"%s\"\n", text.c_str());
+            }
+            ok = synthesize_sync_python(text, pcm, spk_id);
+        }
 
         if (callback) {
             callback(ok, text,
@@ -452,7 +642,16 @@ void TtsEngine::worker_loop() {
                         : "Synthesis failed");
         }
 
-        m_busy = false;
-        m_cv.notify_one();  // notify wait_for_done()
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (kind == 1) {
+                m_result_pcm = std::move(pcm);
+            }
+            m_pending_kind = 0;
+            m_request_ok = ok;
+            m_request_done = true;
+            m_busy = false;
+        }
+        m_cv.notify_all();
     }
 }

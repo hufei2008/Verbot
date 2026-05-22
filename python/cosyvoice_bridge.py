@@ -32,7 +32,7 @@ _model_id = ""
 _voice = "Vivian"
 _language = "Chinese"
 _speed = 1.0
-_streaming_interval = 0.32
+_streaming_interval = 0.16
 _source_sample_rate = 24000
 _output_sample_rate = 24000
 _max_audio_sec = 8.0
@@ -72,7 +72,7 @@ def init(model_dir: str) -> str:
     _voice = os.environ.get("QWEN_TTS_VOICE", "Vivian")
     _language = os.environ.get("QWEN_TTS_LANGUAGE", "Chinese")
     _speed = float(os.environ.get("QWEN_TTS_SPEED", os.environ.get("TTS_SPEED", "1.0")))
-    _streaming_interval = float(os.environ.get("QWEN_TTS_STREAMING_INTERVAL", "0.32"))
+    _streaming_interval = float(os.environ.get("QWEN_TTS_STREAMING_INTERVAL", "0.16"))
     _source_sample_rate = int(os.environ.get("QWEN_TTS_SOURCE_SAMPLE_RATE", "24000"))
     _output_sample_rate = int(os.environ.get("TTS_SAMPLE_RATE", str(_source_sample_rate)))
     _max_audio_sec = float(os.environ.get("QWEN_TTS_MAX_AUDIO_SEC", "8.0"))
@@ -170,9 +170,9 @@ def _ensure_ready() -> bool:
 
 
 def _resolve_voice(spk_id: str) -> str:
-    if not spk_id:
-        return _voice
-    return _speaker_map.get(spk_id, spk_id)
+    # This assistant uses one fixed female voice. Ignore per-call speaker ids so
+    # ASR/LLM-side labels cannot accidentally switch the TTS voice.
+    return _voice
 
 
 def _generate(text: str, voice: str, stream: bool):

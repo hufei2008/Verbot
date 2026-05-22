@@ -46,6 +46,12 @@ struct Action {
     float confidence = 0.0f;     // 置信度
 };
 
+struct TaskPlan {
+    std::string reply;            // 最终播报
+    std::vector<Action> actions;  // 需要执行的任务
+    float confidence = 0.0f;
+};
+
 using ActionCallback = std::function<void(const Action&)>;
 
 // ---- 语义引擎类 ----
@@ -117,8 +123,8 @@ private:
     // ──────────────────────────────────────────────────────
 
     // 解析 LLM 输出中的 Action JSON
-    // 解析 LLM 输出中的 Action JSON
     Action parse_llm_response(const std::string& llm_output);
+    TaskPlan parse_task_plan(const std::string& llm_output);
 
     // 默认 Action 处理器（显示日志和打印）
     void default_action_handler(const Action& action);

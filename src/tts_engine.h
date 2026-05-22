@@ -84,6 +84,9 @@ public:
     /// 等待异步请求完成（阻塞）
     void wait_for_done();
 
+    /// 关闭引擎，释放 Python 资源（需在 main() 返回前、Python 仍健康时调用）
+    void shutdown();
+
     /// 取消当前请求
     void cancel();
 
@@ -98,6 +101,12 @@ private:
     void worker_loop();
     bool ensure_python_initialized();
     bool load_bridge_module();
+    bool synthesize_sync_python(const std::string& text,
+                                std::vector<int16_t>& out_pcm,
+                                const std::string& spk_id);
+    bool synthesize_stream_python(const std::string& text,
+                                  const std::string& spk_id,
+                                  TtsStreamChunkCallback on_chunk);
 
     // ──────────────────────────────────────────────────────
     // 状态
@@ -120,6 +129,11 @@ private:
     std::string m_pending_text;
     std::string m_pending_spk_id;
     TtsEngineDoneCallback m_pending_callback;
+    TtsStreamChunkCallback m_pending_stream_callback;
+    std::vector<int16_t> m_result_pcm;
+    bool m_request_done{false};
+    bool m_request_ok{false};
+    int m_pending_kind{0};  // 0 none, 1 sync, 2 stream, 3 async
     bool m_has_pending{false};
 
     // Python 解释器状态

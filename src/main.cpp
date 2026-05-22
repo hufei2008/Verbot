@@ -17,6 +17,8 @@
 #include <future>
 #include <csignal>
 #include <unistd.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
 
 // ANSI colors
 #define COLOR_CYAN    "\033[36m"
@@ -35,12 +37,22 @@ constexpr bool VAD_DEBUG_LOG = false;
 static volatile std::sig_atomic_t g_stop_requested = 0;
 static volatile std::sig_atomic_t g_graceful_sigint_enabled = 0;
 
-static void handle_sigint(int) {
-    if (!g_graceful_sigint_enabled || g_stop_requested) {
-        _exit(130);
+    static void handle_sigint(int) {
+        if (!g_graceful_sigint_enabled || g_stop_requested) {
+            _exit(130);
+        }
+        g_stop_requested = 1;
     }
-    g_stop_requested = 1;
-}
+
+    // 安全退出辅助函数：跳过 Python/MLX 的 atexit/finalizer 链。
+    // 嵌入式 Python 加载 MLX、tokenizers 后，正常 return/exit 可能在
+    // 进程收尾时触发 C 扩展析构并 crash。这里先 flush 日志，再直接
+    // _exit，保留正常退出码。
+    static void safe_exit(int code) {
+        fflush(nullptr);
+        _exit(code);
+        __builtin_unreachable();
+    }
 
 // 线程安全的环形缓冲
 class RingBuffer {
@@ -99,6 +111,12 @@ static float compute_peak(const float* data, size_t n) {
     return peak;
 }
 
+static bool should_skip_low_quality_segment(double durSec, float rms, float peak) {
+    if (durSec < 0.45) return true;
+    if (durSec < 0.85 && rms < 0.016f && peak < 0.055f) return true;
+    return false;
+}
+
 // ★ 改进：简单高通 FIR 滤波器，滤除 80Hz 以下低频噪声（空调/风扇/风声）
 static void highpass_filter(std::vector<float>& data, float cutoff, int sampleRate) {
     const float dt = 1.0f / sampleRate;
@@ -150,8 +168,11 @@ static void execute_action(const Action& action) {
 
 static bool looks_like_asr_prompt_artifact(const std::string& text) {
     if (text.empty()) return true;
+    if (text == "," || text == "." || text == "?" || text == "!" ||
+        text == "，" || text == "。" || text == "？" || text == "！") return true;
     if (text == "嗯" || text == "嗯嗯" || text == "啊" || text == "哦") return true;
     if (text == "咳" || text == "咳咳" || text == "咳咳咳") return true;
+    if (text == "哼" || text == "哼哼") return true;
     if (text.find("打开关闭保存删除复制粘贴撤回发送") != std::string::npos) return true;
     if (text.find("请问有什么可以帮助你的") != std::string::npos &&
         text.find("他说他们说") != std::string::npos) return true;
@@ -174,12 +195,21 @@ int main(int argc, char ** argv) {
     std::string textInput;
 
     bool textMode = false;
+    bool argError = false;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--text" && i + 1 < argc) {
+        if (arg == "--text") {
             textMode = true;
+            if (i + 1 >= argc) {
+                argError = true;
+                break;
+            }
             textInput = argv[++i];
-        } else if (arg == "--llm" && i + 1 < argc) {
+        } else if (arg == "--llm") {
+            if (i + 1 >= argc) {
+                argError = true;
+                break;
+            }
             llmModelPath = argv[++i];
         } else if (!textMode) {
             if (i == 1) whisperModel = arg;
@@ -188,7 +218,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (textMode && textInput.empty()) {
+    if (argError || (textMode && textInput.empty())) {
         fprintf(stderr, "Usage: %s --text \"打开计算器\" [--llm path/to/model.gguf]\n", argv[0]);
         return 1;
     }
@@ -209,20 +239,21 @@ int main(int argc, char ** argv) {
 
     // TTS 状态
     if (semanticEngine.tts_ready()) {
-        printf("%s[%s] TTS ready (Embedded CosyVoice via Python bridge)%s\n",
+        printf("%s[%s] TTS ready (Embedded Qwen3-TTS via Python bridge)%s\n",
                COLOR_GREEN, current_time_str().c_str(), COLOR_RESET);
     } else {
         printf("%s[%s] TTS not available. "
                "To enable, set:\n"
-               "  export COSYVOICE_MODEL_DIR=/path/to/CosyVoice/pretrained_models/CosyVoice-300M\n"
-               "  export COSYVOICE_PYTHON_HOME=/path/to/conda/envs/cosyvoice\n"
-               "  export COSYVOICE_BRIDGE_DIR=/path/to/study2/python%s\n",
+               "  export QWEN_TTS_MODEL=mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16\n"
+               "  export QWEN_TTS_PYTHON_HOME=/path/to/conda/envs/cosyvoice\n"
+               "  export QWEN_TTS_BRIDGE_DIR=/path/to/study2/python%s\n",
                COLOR_YELLOW, current_time_str().c_str(), COLOR_RESET);
     }
 
     if (textMode) {
         std::promise<void> done;
         auto future = done.get_future();
+        bool doneSet = false;
         g_graceful_sigint_enabled = 1;
 
         printf("%s🧠 [%s] Text mode input: \"%s\"%s\n",
@@ -233,6 +264,10 @@ int main(int argc, char ** argv) {
                 printf("\n%s🤖 %s%s\n",
                        COLOR_BOLD COLOR_CYAN, action.response_text.c_str(), COLOR_RESET);
                 // TTS 由 SemanticEngine 内部自动处理
+                if (!doneSet) {
+                    doneSet = true;
+                    done.set_value();
+                }
             }
 
             if (action.type != ActionType::NONE) {
@@ -243,22 +278,18 @@ int main(int argc, char ** argv) {
                        COLOR_RESET);
                 execute_action(action);
             }
-
-            done.set_value();
         });
 
         while (future.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) {
             if (g_stop_requested) {
                 fprintf(stderr, "\nInterrupted.\n");
-                semanticEngine.shutdown();
-                _exit(130);
+                safe_exit(130);
             }
         }
 
         if (g_stop_requested) {
             fprintf(stderr, "\nInterrupted.\n");
-            semanticEngine.shutdown();
-            _exit(130);
+            safe_exit(130);
         }
 
         // 等待 TTS 播放完成
@@ -267,12 +298,10 @@ int main(int argc, char ** argv) {
         while (!g_stop_requested && !semanticEngine.wait_for_tts_for(100)) {}
         if (g_stop_requested) {
             fprintf(stderr, "\nInterrupted.\n");
-            semanticEngine.shutdown();
-            _exit(130);
+            safe_exit(130);
         }
 
-        semanticEngine.shutdown();
-        return 0;
+        safe_exit(0);
     }
 
     // ============================================================
@@ -288,8 +317,7 @@ int main(int argc, char ** argv) {
     struct whisper_context * ctx = whisper_init_from_file_with_params(whisperModel.c_str(), cparams);
     if (!ctx) {
         std::cerr << "Failed to load Whisper model!" << std::endl;
-        semanticEngine.shutdown();
-        return 1;
+        safe_exit(1);
     }
     printf("%s[%s] Whisper model loaded.%s\n",
            COLOR_GREEN, current_time_str().c_str(), COLOR_RESET);
@@ -309,8 +337,7 @@ int main(int argc, char ** argv) {
     if (!vctx) {
         std::cerr << "Failed to load VAD model!" << std::endl;
         whisper_free(ctx);
-        semanticEngine.shutdown();
-        return 1;
+        safe_exit(1);
     }
     printf("%s[%s] VAD model loaded.%s\n",
            COLOR_GREEN, current_time_str().c_str(), COLOR_RESET);
@@ -345,8 +372,7 @@ int main(int argc, char ** argv) {
         std::cerr << "Failed to start recording!" << std::endl;
         whisper_vad_free(vctx);
         whisper_free(ctx);
-        semanticEngine.shutdown();
-        return 1;
+        safe_exit(1);
     }
 
     // ============================================================
@@ -512,6 +538,22 @@ int main(int argc, char ** argv) {
             highpass_filter(speechBuffer, 80.0f, SAMPLE_RATE);
 
             double durSec = speechBuffer.size() / (double)SAMPLE_RATE;
+            float segmentRms = compute_rms(speechBuffer.data(), speechBuffer.size());
+            float segmentPeak = compute_peak(speechBuffer.data(), speechBuffer.size());
+
+            if (should_skip_low_quality_segment(durSec, segmentRms, segmentPeak)) {
+                printf("%s⚠ [%s] Ignoring low-quality speech segment (%.1fs, rms=%.4f, peak=%.4f)%s\n",
+                       COLOR_YELLOW, current_time_str().c_str(), durSec,
+                       segmentRms, segmentPeak, COLOR_RESET);
+                speechBuffer.clear();
+                speechFrames = 0;
+                silenceFrames = 0;
+                state = STATE_IDLE;
+                printf("%s──────────────────────────────────────────────────%s\n",
+                       COLOR_CYAN, COLOR_RESET);
+                continue;
+            }
+
             printf("%s📏 [%s] Speech segment (%.1fs, %zu samples)%s\n",
                    COLOR_CYAN, current_time_str().c_str(), durSec,
                    speechBuffer.size(), COLOR_RESET);
@@ -526,7 +568,7 @@ int main(int argc, char ** argv) {
             wparams.language         = "zh";
             wparams.n_threads        = std::min(4, (int)std::thread::hardware_concurrency());
 
-            wparams.no_context       = false;
+            wparams.no_context       = true;
             wparams.single_segment   = false;
             wparams.suppress_blank   = true;
             wparams.suppress_nst     = true;
@@ -607,7 +649,7 @@ int main(int argc, char ** argv) {
                     static auto lastSubmittedAt = std::chrono::steady_clock::now() - std::chrono::seconds(60);
                     auto now = std::chrono::steady_clock::now();
                     if (asr_text == lastSubmittedText &&
-                        now - lastSubmittedAt < std::chrono::seconds(5)) {
+                        now - lastSubmittedAt < std::chrono::seconds(20)) {
                         printf("%s⚠ [%s] Ignoring duplicate ASR: \"%s\"%s\n",
                                COLOR_YELLOW, current_time_str().c_str(),
                                asr_text.c_str(), COLOR_RESET);
@@ -669,11 +711,12 @@ int main(int argc, char ** argv) {
     recorder.stop();
     whisper_vad_free(vctx);
     whisper_free(ctx);
-    semanticEngine.shutdown();
 
+    // 使用 safe_exit 而非 exit()/return，避免 Python finalization crash。
+    // 详见 safe_exit() 注释。
     if (g_stop_requested) {
-        _exit(130);
+        safe_exit(130);
     }
 
-    return 0;
+    safe_exit(0);
 }
