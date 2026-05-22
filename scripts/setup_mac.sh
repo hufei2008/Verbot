@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# setup_mac.sh - 在其他 Mac 电脑上一键构建运行 ASR Demo
+# setup_mac.sh - 在其他 Mac 电脑上一键构建运行 Verbot
 #
 # 使用方法:
 #   将整个工程文件夹拷贝到新的 Mac 上，然后:
@@ -21,7 +21,7 @@ cd "$(dirname "$0")/.."
 PROJECT_DIR="$(pwd)"
 
 echo "=========================================="
-echo " ASR Demo - macOS 一键构建脚本"
+echo " Verbot - macOS 一键构建脚本"
 echo "=========================================="
 echo ""
 
@@ -94,7 +94,7 @@ echo "[5/5] 开始编译..."
 
 mkdir -p build
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target asr_demo -j "$(sysctl -n hw.ncpu)"
+cmake --build build --target Verbot -j "$(sysctl -n hw.ncpu)"
 
 echo ""
 echo "=========================================="
@@ -102,7 +102,7 @@ echo " ✅ 构建成功!"
 echo "=========================================="
 echo ""
 echo "运行方式:"
-echo "  cd build && ./asr_demo"
+echo "  cd build && ./Verbot"
 echo ""
 echo "注意:"
 echo "  - 第一次运行时，macOS 可能会请求麦克风权限"

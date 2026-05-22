@@ -5,7 +5,7 @@
 # 使用方法:
 #   ./scripts/build_release.sh
 #
-# 这将在 build/ 目录下编译 asr_demo，然后打包成 zip 发布包
+# 这将在 build/ 目录下编译 Verbot，然后打包成 zip 发布包
 #
 
 set -euo pipefail
@@ -14,7 +14,7 @@ cd "$(dirname "$0")/.."
 PROJECT_DIR="$(pwd)"
 
 echo "=========================================="
-echo " ASR Demo - Release Package Builder"
+echo " Verbot - Release Package Builder"
 echo "=========================================="
 
 # 检查 whisper.cpp 依赖
@@ -44,22 +44,22 @@ echo "[1/3] 配置 CMake (Release 模式)..."
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
 echo ""
-echo "[2/3] 编译 asr_demo..."
-cmake --build build --target asr_demo -j "$(sysctl -n hw.ncpu)"
+echo "[2/3] 编译 Verbot..."
+cmake --build build --target Verbot -j "$(sysctl -n hw.ncpu)"
 
 echo ""
 echo "[3/3] 打包发布包..."
 
 # 确定版本号（使用 git tag 或日期）
 VERSION="$(git describe --tags --always 2>/dev/null || date '+%Y%m%d')"
-PKG_NAME="asr_demo-${VERSION}-macos"
+PKG_NAME="Verbot-${VERSION}-macos"
 
 # 创建发布目录
 RELEASE_DIR="build/${PKG_NAME}"
 mkdir -p "${RELEASE_DIR}"
 
 # 复制二进制文件
-cp build/asr_demo "${RELEASE_DIR}/"
+cp build/Verbot "${RELEASE_DIR}/"
 
 # 复制模型文件
 cp -R models "${RELEASE_DIR}/models"
@@ -74,7 +74,7 @@ cat > "${RELEASE_DIR}/run.sh" << 'SCRIPT'
 #!/bin/bash
 DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
-./asr_demo
+./Verbot
 SCRIPT
 chmod +x "${RELEASE_DIR}/run.sh"
 

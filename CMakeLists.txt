@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(asr_demo C CXX)
+project(Verbot C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -42,9 +42,9 @@ add_subdirectory(vendor/whisper.cpp)
 set(TTS_PYTHON_PREFIX "/opt/homebrew/Caskroom/miniforge/base/envs/cosyvoice")
 
 # ════════════════════════════════════════
-# 4. ASR 主程序 (含语义理解 + TTS)
+# 4. 主程序 (含语义理解 + TTS)
 # ════════════════════════════════════════
-add_executable(asr_demo
+add_executable(Verbot
     src/main.cpp
     src/audio_recorder.cpp
     src/audio_recorder.h
@@ -62,7 +62,7 @@ add_executable(asr_demo
     src/audio_player.h
 )
 
-target_include_directories(asr_demo PRIVATE
+target_include_directories(Verbot PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/vendor/whisper.cpp/include
     ${CMAKE_SOURCE_DIR}/vendor/llama.cpp/include
@@ -70,7 +70,7 @@ target_include_directories(asr_demo PRIVATE
     ${TTS_PYTHON_PREFIX}/lib/python3.10/site-packages/numpy/core/include
 )
 
-target_link_libraries(asr_demo PRIVATE
+target_link_libraries(Verbot PRIVATE
     whisper
     llama
     ${AUDIO_TOOLBOX}
@@ -79,10 +79,10 @@ target_link_libraries(asr_demo PRIVATE
 )
 
 # 复制 Python bridge 脚本到构建目录
-add_custom_command(TARGET asr_demo POST_BUILD
+add_custom_command(TARGET Verbot POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${CMAKE_SOURCE_DIR}/python
-        $<TARGET_FILE_DIR:asr_demo>/python
+        $<TARGET_FILE_DIR:Verbot>/python
     COMMENT "Copying Python bridge scripts to build directory"
 )
 
@@ -140,10 +140,10 @@ add_custom_command(TARGET test_tts POST_BUILD
 # ════════════════════════════════════════
 # 6. 复制模型文件到构建目录
 # ════════════════════════════════════════
-add_custom_command(TARGET asr_demo POST_BUILD
+add_custom_command(TARGET Verbot POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${CMAKE_SOURCE_DIR}/models
-        $<TARGET_FILE_DIR:asr_demo>/models
+        $<TARGET_FILE_DIR:Verbot>/models
     COMMENT "Copying models to build directory"
 )
 
