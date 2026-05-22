@@ -12,6 +12,7 @@ endif()
 # macOS 需要 AudioToolbox 框架（AudioUnit 音频播放）
 find_library(AUDIO_TOOLBOX AudioToolbox REQUIRED)
 find_library(AUDIO_UNIT AudioUnit REQUIRED)
+find_package(CURL REQUIRED)
 
 # ════════════════════════════════════════
 # 1. llama.cpp — 大语言模型推理引擎
@@ -62,6 +63,8 @@ add_executable(Verbot
     src/audio_player.h
 )
 
+set_target_properties(Verbot PROPERTIES OUTPUT_NAME asr_demo)
+
 target_include_directories(Verbot PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/vendor/whisper.cpp/include
@@ -75,6 +78,7 @@ target_link_libraries(Verbot PRIVATE
     llama
     ${AUDIO_TOOLBOX}
     ${AUDIO_UNIT}
+    CURL::libcurl
     ${TTS_PYTHON_PREFIX}/lib/libpython3.10.dylib
 )
 

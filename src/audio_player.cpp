@@ -2,6 +2,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <algorithm>
 #include <AudioToolbox/AudioToolbox.h>
 
 // ============================================================
@@ -100,11 +102,17 @@ bool AudioPlayer::init(int sample_rate) {
         m_buffers.push_back(static_cast<void*>(buffer));
     }
 
-    // 设置默认音量
-    AudioQueueSetParameter(queue, kAudioQueueParam_Volume, 1.0);
+    // 统一 TTS/播放器音量。所有 AudioPlayer 实例都从同一个环境变量读取。
+    float volume = 0.85f;
+    if (const char* env_volume = std::getenv("TTS_VOLUME")) {
+        volume = std::atof(env_volume);
+    }
+    volume = std::max(0.0f, std::min(1.0f, volume));
+    AudioQueueSetParameter(queue, kAudioQueueParam_Volume, volume);
 
     m_initialized = true;
-    fprintf(stdout, "[AudioPlayer] Initialized: %dHz, 16-bit mono PCM\n", sample_rate);
+    fprintf(stdout, "[AudioPlayer] Initialized: %dHz, 16-bit mono PCM, volume=%.2f\n",
+            sample_rate, volume);
     return true;
 }
 
@@ -315,6 +323,7 @@ void AudioPlayer::set_finished_callback(std::function<void()> cb) {
 }
 
 void AudioPlayer::set_volume(float vol) {
+    vol = std::max(0.0f, std::min(1.0f, vol));
     AudioQueueRef queue = static_cast<AudioQueueRef>(m_queue);
     AudioQueueSetParameter(queue, kAudioQueueParam_Volume, vol);
 }

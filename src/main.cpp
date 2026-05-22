@@ -156,6 +156,13 @@ static void execute_action(const Action& action) {
                    COLOR_YELLOW, current_time_str().c_str(), COLOR_RESET);
             break;
         }
+        case ActionType::GET_WEATHER: {
+            printf("%s  ↪ Weather API result: %s%s\n",
+                   COLOR_YELLOW,
+                   (!action.params.empty() ? action.params : action.response_text).c_str(),
+                   COLOR_RESET);
+            break;
+        }
         default: {
             if (action.type != ActionType::NONE) {
                 printf("%s  ↪ (No safe handler for %s)%s\n",
@@ -344,9 +351,9 @@ int main(int argc, char ** argv) {
 
     // VAD 参数
     struct whisper_vad_params vad_params = whisper_vad_default_params();
-    vad_params.threshold               = 0.5f;
-    vad_params.min_speech_duration_ms  = 200;
-    vad_params.min_silence_duration_ms = 300;
+    vad_params.threshold               = 0.7f;   // 提高概率阈值，减少噪音误触发
+    vad_params.min_speech_duration_ms  = 300;    // 增加最小语音持续时长
+    vad_params.min_silence_duration_ms = 400;    // 增加沉默判定时长
     vad_params.speech_pad_ms           = 200;
 
     printf("%s[%s] VAD params: thr=%.1f, min_speech=%dms, min_silence=%dms, pad=%dms%s\n",
@@ -405,14 +412,14 @@ int main(int argc, char ** argv) {
     int vadStartCount = 0;
     int speechFrames = 0;
 
-    const int SILENCE_FRAMES_THRESHOLD = 8;
+    const int SILENCE_FRAMES_THRESHOLD = 10;
     int silenceFrames = 0;
 
-    const int MIN_SPEECH_FRAMES = 6;
+    const int MIN_SPEECH_FRAMES = 12;            // 需要更多连续帧才触发
     const int MAX_SPEECH_FRAMES = 30 * 1000 / 32;
 
-    const float SPEECH_RMS_THRESHOLD = 0.01f;
-    float noiseFloor = 0.01f;
+    const float SPEECH_RMS_THRESHOLD = 0.025f;   // 提高能量门槛，小环境音不触发
+    float noiseFloor = 0.025f;
 
     const int PAD_FRAMES = 8;
     std::vector<float> padBuffer;
@@ -442,14 +449,14 @@ int main(int argc, char ** argv) {
         float rms = compute_rms(chunk.data(), (int)chunk.size());
         float peak = compute_peak(chunk.data(), (int)chunk.size());
 
-        if (state == STATE_IDLE && rms < SPEECH_RMS_THRESHOLD * 3.0f) {
-            noiseFloor = 0.995f * noiseFloor + 0.005f * rms;
+        if (state == STATE_IDLE && rms < noiseFloor) {
+            noiseFloor = 0.999f * noiseFloor + 0.001f * rms;
         }
 
         bool vadSpeech = whisper_vad_detect_speech_no_reset(vctx,
                 chunk.data(), (int)chunk.size());
 
-        float adaptiveThreshold = std::max(noiseFloor * 3.0f, SPEECH_RMS_THRESHOLD);
+        float adaptiveThreshold = std::max(noiseFloor * 5.0f, SPEECH_RMS_THRESHOLD);
         bool energyHasSpeech = (rms >= adaptiveThreshold);
 
         bool isSpeech = vadSpeech && energyHasSpeech;

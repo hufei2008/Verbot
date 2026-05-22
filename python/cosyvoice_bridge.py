@@ -69,7 +69,9 @@ def init(model_dir: str) -> str:
         or model_dir
         or "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16"
     )
-    _voice = os.environ.get("QWEN_TTS_VOICE", "Vivian")
+    # ─── 发音人固定为女声 Vivian ───
+    # 忽略 QWEN_TTS_VOICE / TTS_VOICE 环境变量，确保输出语音始终为同一女声。
+    _voice = "Vivian"
     _language = os.environ.get("QWEN_TTS_LANGUAGE", "Chinese")
     _speed = float(os.environ.get("QWEN_TTS_SPEED", os.environ.get("TTS_SPEED", "1.0")))
     _streaming_interval = float(os.environ.get("QWEN_TTS_STREAMING_INTERVAL", "0.16"))
@@ -170,9 +172,9 @@ def _ensure_ready() -> bool:
 
 
 def _resolve_voice(spk_id: str) -> str:
-    # This assistant uses one fixed female voice. Ignore per-call speaker ids so
-    # ASR/LLM-side labels cannot accidentally switch the TTS voice.
-    return _voice
+    # 固定女声：忽略所有传入的 spk_id 和环境变量，始终返回 preset 的女声。
+    # ASR/LLM 侧的任何发音人标签都无法切换 TTS 音色。
+    return "Vivian"
 
 
 def _generate(text: str, voice: str, stream: bool):

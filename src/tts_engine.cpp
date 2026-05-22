@@ -349,15 +349,18 @@ bool TtsEngine::synthesize_sync(const std::string& text,
 
 bool TtsEngine::synthesize_sync_python(const std::string& text,
                                        std::vector<int16_t>& out_pcm,
-                                       const std::string& spk_id) {
+                                       const std::string& /*spk_id*/) {
     out_pcm.clear();
+
+    // ─── 固定女声 "Vivian"，忽略传入的 spk_id ───
+    static const char* kFixedFemaleVoice = "Vivian";
 
     PyObject* bridge = static_cast<PyObject*>(m_py_bridge_module);
 
     // 调用 bridge.synthesize(text, spk_id, "sft")
     PyObject* result = PyObject_CallMethod(bridge, "synthesize", "(sss)",
                                            text.c_str(),
-                                           spk_id.c_str(),
+                                           kFixedFemaleVoice,
                                            "sft");
     if (!result) {
         PyErr_Print();
@@ -444,12 +447,15 @@ bool TtsEngine::synthesize_stream(const std::string& text,
 }
 
 bool TtsEngine::synthesize_stream_python(const std::string& text,
-                                         const std::string& spk_id,
+                                         const std::string& /*spk_id*/,
                                          TtsStreamChunkCallback on_chunk) {
+    // ─── 固定女声 "Vivian"，忽略传入的 spk_id ───
+    static const char* kFixedFemaleVoice = "Vivian";
+
     PyObject* bridge = static_cast<PyObject*>(m_py_bridge_module);
     PyObject* generator = PyObject_CallMethod(bridge, "synthesize_stream", "(sss)",
                                               text.c_str(),
-                                              spk_id.c_str(),
+                                              kFixedFemaleVoice,
                                               "sft");
     if (!generator) {
         PyErr_Print();

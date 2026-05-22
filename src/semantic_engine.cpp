@@ -8,6 +8,7 @@
 #include <thread>
 #include <cstdlib>
 #include <chrono>
+#include <curl/curl.h>
 
 namespace {
 
@@ -183,6 +184,7 @@ ActionType action_type_from_name(const std::string& action_name) {
     if (action_name == "get_time") return ActionType::GET_TIME;
     if (action_name == "set_reminder") return ActionType::SET_REMINDER;
     if (action_name == "play_music") return ActionType::PLAY_MUSIC;
+    if (action_name == "get_weather") return ActionType::GET_WEATHER;
     if (action_name == "custom") return ActionType::CUSTOM;
     return ActionType::NONE;
 }
@@ -225,7 +227,150 @@ std::string spoken_text_for_action(const Action& action) {
     if (action.type == ActionType::GET_TIME) {
         return "我看看时间。";
     }
+    if (action.type == ActionType::GET_WEATHER && !action.target.empty()) {
+        return "查" + action.target + "天气。";
+    }
     return action.response_text;
+}
+
+size_t curl_write_string(void* ptr, size_t size, size_t nmemb, void* userdata) {
+    auto* out = static_cast<std::string*>(userdata);
+    size_t total = size * nmemb;
+    out->append(static_cast<const char*>(ptr), total);
+    return total;
+}
+
+std::string http_get(const std::string& url, long timeout_sec = 8) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return "";
+
+    std::string body;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_string);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_sec);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Verbot/1.0");
+    CURLcode res = curl_easy_perform(curl);
+
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
+        fprintf(stderr, "[Weather] HTTP failed: code=%ld err=%s url=%s\n",
+                http_code, curl_easy_strerror(res), url.c_str());
+        return "";
+    }
+    return body;
+}
+
+std::string url_escape(const std::string& text) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return text;
+    char* escaped = curl_easy_escape(curl, text.c_str(), (int)text.size());
+    std::string out = escaped ? escaped : text;
+    if (escaped) curl_free(escaped);
+    curl_easy_cleanup(curl);
+    return out;
+}
+
+double json_double_value(const std::string& json, const std::string& key, double fallback) {
+    return (double)json_float_value(json, key, (float)fallback);
+}
+
+std::string first_json_object_in_array(const std::string& json, const std::string& key) {
+    std::vector<std::string> objects = json_object_array_value(json, key);
+    return objects.empty() ? "" : objects.front();
+}
+
+std::string clean_weather_location(std::string target) {
+    target = trim_copy(target);
+    const std::string suffixes[] = {"天气怎么样", "的天气", "天气"};
+    for (const auto& suffix : suffixes) {
+        size_t pos = target.find(suffix);
+        if (pos != std::string::npos) {
+            target.erase(pos, suffix.size());
+        }
+    }
+    target = trim_copy(target);
+    return target.empty() ? "北京" : target;
+}
+
+std::string weather_code_text(int code) {
+    if (code == 0) return "晴";
+    if (code == 1 || code == 2 || code == 3) return "多云";
+    if (code == 45 || code == 48) return "有雾";
+    if ((code >= 51 && code <= 57) || (code >= 61 && code <= 67) || (code >= 80 && code <= 82)) return "有雨";
+    if ((code >= 71 && code <= 77) || (code >= 85 && code <= 86)) return "有雪";
+    if (code >= 95 && code <= 99) return "有雷雨";
+    return "天气正常";
+}
+
+std::string completed_text_for_action(const Action& action) {
+    if (action.type == ActionType::OPEN_APP && !action.target.empty()) {
+        if (action.target == "Calculator") return "已打开计算器。";
+        return "已打开" + action.target + "。";
+    }
+    if (action.type == ActionType::SEARCH_WEB && !action.target.empty()) {
+        return "已搜索" + action.target + "。";
+    }
+    if (action.type == ActionType::GET_TIME) {
+        return "已查看时间。";
+    }
+    return "";
+}
+
+std::string query_weather_summary(const std::string& target) {
+    std::string location = clean_weather_location(target);
+    std::string geo_url = "https://geocoding-api.open-meteo.com/v1/search?name=" +
+        url_escape(location) + "&count=1&language=zh&format=json";
+    std::string geo_body = http_get(geo_url);
+    std::string place = first_json_object_in_array(geo_body, "results");
+    if (place.empty()) {
+        return "没找到" + location + "的天气。";
+    }
+
+    double latitude = json_double_value(place, "latitude", 999.0);
+    double longitude = json_double_value(place, "longitude", 999.0);
+    std::string resolved_name = trim_copy(json_string_value(place, "name"));
+    if (resolved_name.empty()) resolved_name = location;
+    if (latitude > 998.0 || longitude > 998.0) {
+        return "没查到" + location + "的坐标。";
+    }
+
+    char forecast_url[1024];
+    snprintf(forecast_url, sizeof(forecast_url),
+             "https://api.open-meteo.com/v1/forecast?latitude=%.6f&longitude=%.6f"
+             "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,precipitation"
+             "&timezone=auto&forecast_days=1",
+             latitude, longitude);
+
+    std::string forecast_body = http_get(forecast_url);
+    size_t current_pos = forecast_body.find("\"current\"");
+    std::string current = current_pos == std::string::npos
+        ? ""
+        : find_json_object(forecast_body.substr(current_pos));
+    if (current.empty()) {
+        return "天气接口暂时没有返回结果。";
+    }
+
+    double temp = json_double_value(current, "temperature_2m", 999.0);
+    double humidity = json_double_value(current, "relative_humidity_2m", -1.0);
+    double wind = json_double_value(current, "wind_speed_10m", -1.0);
+    int code = (int)json_double_value(current, "weather_code", -1.0);
+
+    if (temp > 998.0) {
+        return "天气接口暂时没有温度结果。";
+    }
+
+    char summary[512];
+    snprintf(summary, sizeof(summary),
+             "%s现在%.0f度，%s，湿度%.0f%%，风速%.0f公里每小时。",
+             resolved_name.c_str(), temp, weather_code_text(code).c_str(),
+             humidity < 0.0 ? 0.0 : humidity,
+             wind < 0.0 ? 0.0 : wind);
+    return summary;
 }
 
 }
@@ -233,7 +378,7 @@ std::string spoken_text_for_action(const Action& action) {
 SemanticEngine::SemanticEngine()
     : m_conversation(8) {
     // 初始化 Action 处理器为默认
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0; i < 12; ++i) {
         m_action_handlers[i] = nullptr;
     }
 }
@@ -264,7 +409,7 @@ bool SemanticEngine::init(const std::string& model_path,
         "使用结构化 ReAct：先规划 steps，再由程序执行每个 action，最后用 reply 做语音播报。\n"
         "JSON 字段固定为：reply, steps, confidence。\n"
         "steps 是数组，每个元素字段固定为：action, target, params, confidence。\n"
-        "action 只能是 open_app、search_web、get_time、custom。无动作时 steps 为空数组。\n"
+        "action 只能是 open_app、search_web、get_weather、get_time、custom。无动作时 steps 为空数组。\n"
         "不允许输出 system_cmd。\n"
         "reply 使用中文，必须适合最终语音播报，尽量控制在 20 个汉字以内。\n"
         "params 如果没有额外参数就填空字符串。\n"
@@ -274,15 +419,15 @@ bool SemanticEngine::init(const std::string& model_path,
         "例如：\n"
         "用户说\"打开计算器\"，输出 {\"reply\":\"已打开计算器。\",\"steps\":[{\"action\":\"open_app\",\"target\":\"Calculator\",\"params\":\"\",\"confidence\":0.95}],\"confidence\":0.95}\n"
         "用户说\"帮我搜索 Python 教程\"，输出 {\"reply\":\"已搜索 Python 教程。\",\"steps\":[{\"action\":\"search_web\",\"target\":\"Python 教程\",\"params\":\"\",\"confidence\":0.95}],\"confidence\":0.95}\n"
-        "用户说\"北京天气怎么样\"，输出 {\"reply\":\"已查询北京天气。\",\"steps\":[{\"action\":\"search_web\",\"target\":\"北京天气\",\"params\":\"\",\"confidence\":0.95}],\"confidence\":0.95}\n"
-        "用户说\"打开计算器查上海天气\"，输出 {\"reply\":\"已打开计算器，并查询上海天气。\",\"steps\":[{\"action\":\"open_app\",\"target\":\"Calculator\",\"params\":\"\",\"confidence\":0.95},{\"action\":\"search_web\",\"target\":\"上海天气\",\"params\":\"\",\"confidence\":0.95}],\"confidence\":0.95}\n"
+        "用户说\"北京天气怎么样\"，输出 {\"reply\":\"查询北京天气。\",\"steps\":[{\"action\":\"get_weather\",\"target\":\"北京\",\"params\":\"\",\"confidence\":0.95}],\"confidence\":0.95}\n"
+        "用户说\"打开计算器查上海天气\"，输出 {\"reply\":\"已打开计算器，并查询上海天气。\",\"steps\":[{\"action\":\"open_app\",\"target\":\"Calculator\",\"params\":\"\",\"confidence\":0.95},{\"action\":\"get_weather\",\"target\":\"上海\",\"params\":\"\",\"confidence\":0.95}],\"confidence\":0.95}\n"
         "用户说\"现在几点了\"，输出 {\"reply\":\"我看看时间。\",\"steps\":[{\"action\":\"get_time\",\"target\":\"\",\"params\":\"\",\"confidence\":0.95}],\"confidence\":0.95}\n"
         "用户说\"你好\"，输出 {\"reply\":\"你好，我在。\",\"steps\":[],\"confidence\":0.9}\n"
         "\n"
         "注意：\n"
         "1. 必须准确理解用户意图，不要过度猜测\n"
         "2. 如果不确定，回复用户询问确认\n"
-        "3. 只有用户明确要求打开应用、搜索网页、询问时间时才加入 step\n"
+        "3. 只有用户明确要求打开应用、搜索网页、查询天气、询问时间时才加入 step\n"
         "4. 如果用户说\"结束\"或\"退出\"，只回复告别，steps 为空数组";
 
     m_conversation.set_system_prompt(system_prompt);
@@ -384,12 +529,39 @@ void SemanticEngine::process_asr_result(const std::string& asr_text,
 
         // 6. 分发 Actions。实际系统调用由外层 callback 执行，SemanticEngine
         // 这里只记录结构化日志并保持自定义 handler 兼容。
-        for (const auto& action : plan.actions) {
+        std::vector<std::string> action_summaries;
+        std::vector<std::string> weather_summaries;
+        for (auto action : plan.actions) {
             if (action.type == ActionType::NONE) continue;
+            if (action.type == ActionType::GET_WEATHER) {
+                std::string weather_summary = query_weather_summary(action.target);
+                weather_summaries.push_back(weather_summary);
+                action.params = weather_summary;
+                action.response_text.clear();
+                fprintf(stdout, "[Weather] %s\n", weather_summary.c_str());
+            } else {
+                std::string done = completed_text_for_action(action);
+                if (!done.empty()) {
+                    action_summaries.push_back(done);
+                }
+            }
             dispatch_action(action);
             if (callback) {
                 callback(action);
             }
+        }
+
+        if (!weather_summaries.empty()) {
+            std::string combined;
+            for (const auto& summary : action_summaries) {
+                if (!combined.empty()) combined += " ";
+                combined += summary;
+            }
+            for (const auto& summary : weather_summaries) {
+                if (!combined.empty()) combined += " ";
+                combined += summary;
+            }
+            plan.reply = combined;
         }
 
         // 7. TTS 只播最终总结，避免多任务中每个 action 都触发一段声音。
@@ -417,7 +589,7 @@ void SemanticEngine::process_asr_result(const std::string& asr_text,
 void SemanticEngine::set_action_handler(ActionType type, ActionCallback handler) {
     std::lock_guard<std::mutex> lock(m_handler_mutex);
     int idx = static_cast<int>(type);
-    if (idx >= 0 && idx < 10) {
+    if (idx >= 0 && idx < 12) {
         m_action_handlers[idx] = handler;
     }
 }
@@ -429,7 +601,7 @@ void SemanticEngine::dispatch_action(const Action& action) {
     // 自定义处理器
     std::lock_guard<std::mutex> lock(m_handler_mutex);
     int idx = static_cast<int>(action.type);
-    if (idx >= 0 && idx < 10 && m_action_handlers[idx]) {
+    if (idx >= 0 && idx < 12 && m_action_handlers[idx]) {
         m_action_handlers[idx](action);
     }
 }
@@ -470,6 +642,10 @@ TaskPlan SemanticEngine::parse_task_plan(const std::string& llm_output) {
     for (const auto& step_json : step_objects) {
         Action action = action_from_json_object(step_json);
         action.response_text.clear();
+        if (action.type == ActionType::SEARCH_WEB && action.target.find("天气") != std::string::npos) {
+            action.type = ActionType::GET_WEATHER;
+            action.action_name = "get_weather";
+        }
         if (action.type != ActionType::NONE) {
             plan.actions.push_back(action);
         }
@@ -481,6 +657,10 @@ TaskPlan SemanticEngine::parse_task_plan(const std::string& llm_output) {
         if (single.type != ActionType::NONE) {
             std::string single_reply = single.response_text;
             single.response_text.clear();
+            if (single.type == ActionType::SEARCH_WEB && single.target.find("天气") != std::string::npos) {
+                single.type = ActionType::GET_WEATHER;
+                single.action_name = "get_weather";
+            }
             plan.actions.push_back(single);
             if (plan.reply.empty()) {
                 plan.reply = single_reply;
@@ -517,11 +697,11 @@ std::string SemanticEngine::build_prompt(const std::string& user_input) {
 void SemanticEngine::default_action_handler(const Action& action) {
     const char* type_names[] = {
         "NONE", "OPEN_APP", "SEARCH_WEB", "SEND_MESSAGE",
-        "GET_TIME", "SET_REMINDER", "PLAY_MUSIC", "SYSTEM_CMD", "CUSTOM"
+        "GET_TIME", "SET_REMINDER", "PLAY_MUSIC", "GET_WEATHER", "SYSTEM_CMD", "CUSTOM"
     };
 
     int idx = static_cast<int>(action.type);
-    const char* type_name = (idx >= 0 && idx < 9) ? type_names[idx] : "UNKNOWN";
+    const char* type_name = (idx >= 0 && idx < 10) ? type_names[idx] : "UNKNOWN";
 
     fprintf(stdout, "[Action] type=%s action=\"%s\" target=\"%s\" params=\"%s\" response=\"%s\"\n",
             type_name,
