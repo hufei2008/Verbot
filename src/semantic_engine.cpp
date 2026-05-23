@@ -1,4 +1,5 @@
 #include "semantic_engine.h"
+#include "china_cities.h"
 
 #include <cstdio>
 #include <cstring>
@@ -323,21 +324,16 @@ std::string completed_text_for_action(const Action& action) {
 
 std::string query_weather_summary(const std::string& target) {
     std::string location = clean_weather_location(target);
-    std::string geo_url = "https://geocoding-api.open-meteo.com/v1/search?name=" +
-        url_escape(location) + "&count=1&language=zh&format=json";
-    std::string geo_body = http_get(geo_url);
-    std::string place = first_json_object_in_array(geo_body, "results");
-    if (place.empty()) {
+
+    int city_idx = find_city(location);
+    if (city_idx < 0) {
         return "没找到" + location + "的天气。";
     }
 
-    double latitude = json_double_value(place, "latitude", 999.0);
-    double longitude = json_double_value(place, "longitude", 999.0);
-    std::string resolved_name = trim_copy(json_string_value(place, "name"));
+    double latitude = CHINA_CITIES[city_idx].lat;
+    double longitude = CHINA_CITIES[city_idx].lng;
+    std::string resolved_name = CHINA_CITIES[city_idx].name;
     if (resolved_name.empty()) resolved_name = location;
-    if (latitude > 998.0 || longitude > 998.0) {
-        return "没查到" + location + "的坐标。";
-    }
 
     char forecast_url[1024];
     snprintf(forecast_url, sizeof(forecast_url),
