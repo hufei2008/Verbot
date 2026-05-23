@@ -35,6 +35,7 @@ enum class ActionType {
     SET_REMINDER,   // 设置提醒
     PLAY_MUSIC,     // 播放音乐
     GET_WEATHER,    // 查询天气
+    OPEN_DOMAIN_QA, // 开放域问答
     SYSTEM_CMD,     // 系统命令
     CUSTOM,         // 自定义操作
 };
@@ -142,7 +143,7 @@ private:
     ConversationManager    m_conversation;
 
     // Action 处理器映射
-    ActionCallback m_action_handlers[12];
+    ActionCallback m_action_handlers[13];
     std::mutex     m_handler_mutex;
 
     // ──────────────────────────────────────────────────────

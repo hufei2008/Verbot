@@ -25,3 +25,7 @@ test_speech.wav
 *.bak
 # Python cache
 __pycache__/
+
+# Local secrets
+.env
+config/baidu_api_key.txt

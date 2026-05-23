@@ -163,6 +163,13 @@ static void execute_action(const Action& action) {
                    COLOR_RESET);
             break;
         }
+        case ActionType::OPEN_DOMAIN_QA: {
+            printf("%s  ↪ Open-domain QA result: %s%s\n",
+                   COLOR_YELLOW,
+                   (!action.params.empty() ? action.params : action.response_text).c_str(),
+                   COLOR_RESET);
+            break;
+        }
         default: {
             if (action.type != ActionType::NONE) {
                 printf("%s  ↪ (No safe handler for %s)%s\n",

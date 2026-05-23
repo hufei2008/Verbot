@@ -9,6 +9,9 @@
 #include <thread>
 #include <cstdlib>
 #include <chrono>
+#include <cctype>
+#include <fstream>
+#include <ctime>
 #include <curl/curl.h>
 
 namespace {
@@ -181,6 +184,7 @@ float json_float_value(const std::string& json, const std::string& key, float fa
 ActionType action_type_from_name(const std::string& action_name) {
     if (action_name == "open_app") return ActionType::OPEN_APP;
     if (action_name == "search_web") return ActionType::SEARCH_WEB;
+    if (action_name == "open_domain_qa") return ActionType::OPEN_DOMAIN_QA;
     if (action_name == "send_message") return ActionType::SEND_MESSAGE;
     if (action_name == "get_time") return ActionType::GET_TIME;
     if (action_name == "set_reminder") return ActionType::SET_REMINDER;
@@ -266,6 +270,79 @@ std::string http_get(const std::string& url, long timeout_sec = 8) {
     return body;
 }
 
+std::string http_get_with_headers(const std::string& url,
+                                  const std::vector<std::string>& headers,
+                                  long timeout_sec = 8) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return "";
+
+    std::string body;
+    struct curl_slist* header_list = nullptr;
+    for (const auto& header : headers) {
+        header_list = curl_slist_append(header_list, header.c_str());
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header_list);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_string);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_sec);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Verbot/1.0");
+    CURLcode res = curl_easy_perform(curl);
+
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_slist_free_all(header_list);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
+        fprintf(stderr, "[OpenDomainQA] HTTP GET failed: code=%ld err=%s url=%s body=%s\n",
+                http_code, curl_easy_strerror(res), url.c_str(), body.c_str());
+        return "";
+    }
+    return body;
+}
+
+std::string http_post_json(const std::string& url,
+                           const std::string& body_json,
+                           const std::vector<std::string>& headers,
+                           long timeout_sec = 12) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return "";
+
+    std::string body;
+    struct curl_slist* header_list = nullptr;
+    for (const auto& header : headers) {
+        header_list = curl_slist_append(header_list, header.c_str());
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body_json.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body_json.size());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header_list);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_string);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_sec);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Verbot/1.0");
+
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+    curl_slist_free_all(header_list);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
+        fprintf(stderr, "[OpenDomainQA] HTTP POST failed: code=%ld err=%s url=%s body=%s\n",
+                http_code, curl_easy_strerror(res), url.c_str(), body.c_str());
+        return "";
+    }
+    return body;
+}
+
 std::string url_escape(const std::string& text) {
     CURL* curl = curl_easy_init();
     if (!curl) return text;
@@ -278,6 +355,22 @@ std::string url_escape(const std::string& text) {
 
 double json_double_value(const std::string& json, const std::string& key, double fallback) {
     return (double)json_float_value(json, key, (float)fallback);
+}
+
+std::string json_escape(const std::string& text) {
+    std::string out;
+    out.reserve(text.size() + 16);
+    for (char c : text) {
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '"': out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default: out.push_back(c); break;
+        }
+    }
+    return out;
 }
 
 std::string first_json_object_in_array(const std::string& json, const std::string& key) {
@@ -308,6 +401,20 @@ std::string weather_code_text(int code) {
     return "天气正常";
 }
 
+std::string current_time_summary() {
+    std::time_t t = std::time(nullptr);
+    std::tm local_tm{};
+#if defined(_WIN32)
+    localtime_s(&local_tm, &t);
+#else
+    localtime_r(&t, &local_tm);
+#endif
+
+    char buf[64];
+    std::strftime(buf, sizeof(buf), "现在是%H点%M分。", &local_tm);
+    return std::string(buf);
+}
+
 std::string completed_text_for_action(const Action& action) {
     if (action.type == ActionType::OPEN_APP && !action.target.empty()) {
         if (action.target == "Calculator") return "已打开计算器。";
@@ -317,7 +424,7 @@ std::string completed_text_for_action(const Action& action) {
         return "已搜索" + action.target + "。";
     }
     if (action.type == ActionType::GET_TIME) {
-        return "已查看时间。";
+        return current_time_summary();
     }
     return "";
 }
@@ -369,12 +476,256 @@ std::string query_weather_summary(const std::string& target) {
     return summary;
 }
 
+std::string baidu_api_key() {
+    static const char* kBaiduAiSearchApiKeyFallback =
+        "bce-v3/ALTAK-ndZE5c6FneGJnHthA8N9p/632734f2b9d262c7ae706ca6a76c2df7254ebe3f";
+
+    const char* key = std::getenv("BAIDU_AI_SEARCH_API_KEY");
+    if (!key || !key[0]) key = std::getenv("BAIDU_API_KEY");
+    if (!key || !key[0]) key = std::getenv("QIANFAN_API_KEY");
+    std::string value = key ? trim_copy(key) : "";
+    if (!value.empty()) {
+        return value;
+    }
+
+    auto read_key_file = [](const std::string& path) -> std::string {
+        std::ifstream in(path);
+        if (!in.is_open()) return "";
+
+        std::string line;
+        while (std::getline(in, line)) {
+            line = trim_copy(line);
+            if (line.empty() || line[0] == '#') continue;
+
+            size_t eq = line.find('=');
+            if (eq != std::string::npos) {
+                std::string name = trim_copy(line.substr(0, eq));
+                if (name != "BAIDU_AI_SEARCH_API_KEY" &&
+                    name != "BAIDU_API_KEY" &&
+                    name != "QIANFAN_API_KEY") {
+                    continue;
+                }
+                line = trim_copy(line.substr(eq + 1));
+            }
+
+            if (line.size() >= 2 &&
+                ((line.front() == '"' && line.back() == '"') ||
+                 (line.front() == '\'' && line.back() == '\''))) {
+                line = line.substr(1, line.size() - 2);
+            }
+            return trim_copy(line);
+        }
+        return "";
+    };
+
+    const char* home = std::getenv("HOME");
+    const std::vector<std::string> paths = {
+        ".env",
+        "../.env",
+        "config/baidu_api_key.txt",
+        "../config/baidu_api_key.txt",
+        home ? std::string(home) + "/.verbot/baidu_api_key.txt" : ""
+    };
+    for (const auto& path : paths) {
+        if (path.empty()) continue;
+        value = read_key_file(path);
+        if (!value.empty()) {
+            fprintf(stdout, "[OpenDomainQA] Loaded Baidu API key from %s\n", path.c_str());
+            return value;
+        }
+    }
+
+    return kBaiduAiSearchApiKeyFallback;
+}
+
+std::string extract_open_domain_source(const Action& action) {
+    std::string params = action.params;
+    std::transform(params.begin(), params.end(), params.begin(), [](unsigned char c) {
+        return (char)std::tolower(c);
+    });
+    if (params.find("baike") != std::string::npos || params.find("百科") != std::string::npos) {
+        return "baidu_baike";
+    }
+    if (params.find("news") != std::string::npos || params.find("新闻") != std::string::npos) {
+        return "baidu_news";
+    }
+
+    const std::string& q = action.target;
+    if (q.find("新闻") != std::string::npos || q.find("最近") != std::string::npos ||
+        q.find("最新") != std::string::npos || q.find("热点") != std::string::npos ||
+        q.find("发生了什么") != std::string::npos) {
+        return "baidu_news";
+    }
+    if (q.find("是什么") != std::string::npos || q.find("介绍") != std::string::npos ||
+        q.find("百科") != std::string::npos || q.find("谁是") != std::string::npos) {
+        return "baidu_baike";
+    }
+    return "baidu_search";
+}
+
+std::string clean_baike_query(std::string query) {
+    query = trim_copy(query);
+    const std::string prefixes[] = {"介绍一下", "介绍下", "查一下", "查下", "百度百科", "百科"};
+    for (const auto& prefix : prefixes) {
+        size_t pos = query.find(prefix);
+        if (pos == 0) {
+            query.erase(0, prefix.size());
+            break;
+        }
+    }
+    const std::string suffixes[] = {"是什么", "是谁", "的百科", "百科"};
+    for (const auto& suffix : suffixes) {
+        size_t pos = query.find(suffix);
+        if (pos != std::string::npos) {
+            query.erase(pos, suffix.size());
+        }
+    }
+    query = trim_copy(query);
+    return query.empty() ? "百度" : query;
+}
+
+std::string extract_ai_search_answer(const std::string& json) {
+    size_t choices = json.find("\"choices\"");
+    if (choices == std::string::npos) return "";
+    size_t message = json.find("\"message\"", choices);
+    if (message == std::string::npos) return "";
+    return trim_copy(json_string_value(json.substr(message), "content"));
+}
+
+std::string clean_spoken_answer(std::string text) {
+    const std::string marks[] = {"**", "__", "`", "#", "- "};
+    for (const auto& mark : marks) {
+        size_t pos = 0;
+        while ((pos = text.find(mark, pos)) != std::string::npos) {
+            text.erase(pos, mark.size());
+        }
+    }
+    return trim_copy(text);
+}
+
+std::string baidu_baike_answer(const std::string& query, const std::string& api_key) {
+    std::string lemma = clean_baike_query(query);
+    std::string url = "https://appbuilder.baidu.com/v2/baike/lemma/get_content"
+        "?search_type=lemmaTitle&search_key=" + url_escape(lemma);
+    std::vector<std::string> headers = {
+        "Authorization: Bearer " + api_key,
+        "Content-Type: application/json"
+    };
+
+    std::string body = http_get_with_headers(url, headers, 10);
+
+    std::string result = first_json_object_in_array(body, "result");
+    if (result.empty()) {
+        size_t result_pos = body.find("\"result\"");
+        if (result_pos != std::string::npos) {
+            result = find_json_object(body.substr(result_pos));
+        }
+    }
+
+    std::string title = json_string_value(result, "lemma_title");
+    std::string desc = json_string_value(result, "lemma_desc");
+    std::string summary = json_string_value(result, "summary");
+    if (summary.empty()) summary = json_string_value(result, "abstract_plain");
+
+    std::string answer;
+    if (!title.empty()) answer += title + "：";
+    if (!desc.empty()) answer += desc + "。";
+    answer += summary;
+    answer = trim_copy(answer);
+    if (answer.size() > 420) {
+        answer = answer.substr(0, 420) + "。";
+    }
+    return answer;
+}
+
+std::string baidu_ai_search_answer(const std::string& query,
+                                   const std::string& source,
+                                   const std::string& api_key) {
+    std::string effective_query = query;
+    std::string recency;
+    if (source == "baidu_news") {
+        effective_query += " 最新新闻";
+        recency = "\"search_recency_filter\":\"week\",";
+    }
+
+    std::string model = "ernie-4.5-turbo-32k";
+    if (const char* env_model = std::getenv("BAIDU_AI_SEARCH_MODEL")) {
+        if (env_model[0]) model = env_model;
+    }
+
+    std::string instruction =
+        "你是语音助手。请只用中文口语回答，控制在80字以内；"
+        "不要使用 Markdown、星号、编号或引用标记；"
+        "新闻类最多说三点；不确定时明确说未查到可靠信息。";
+
+    std::string body =
+        "{"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"" + json_escape(effective_query) + "\"}],"
+        "\"search_source\":\"baidu_search_v2\","
+        "\"resource_type_filter\":[{\"type\":\"web\",\"top_k\":4}],"
+        + recency +
+        "\"stream\":false,"
+        "\"model\":\"" + json_escape(model) + "\","
+        "\"instruction\":\"" + json_escape(instruction) + "\","
+        "\"temperature\":0.1,"
+        "\"top_p\":0.5,"
+        "\"search_mode\":\"required\","
+        "\"enable_reasoning\":false,"
+        "\"enable_deep_search\":false,"
+        "\"enable_followup_queries\":false,"
+        "\"enable_corner_markers\":false,"
+        "\"response_format\":\"text\","
+        "\"max_completion_tokens\":\"160\""
+        "}";
+
+    std::vector<std::string> headers = {
+        "Authorization: Bearer " + api_key,
+        "X-Appbuilder-Authorization: Bearer " + api_key,
+        "Content-Type: application/json"
+    };
+    std::string response = http_post_json(
+        "https://qianfan.baidubce.com/v2/ai_search/chat/completions",
+        body,
+        headers,
+        15);
+    return extract_ai_search_answer(response);
+}
+
+std::string query_open_domain_answer(const Action& action) {
+    std::string query = trim_copy(action.target.empty() ? action.response_text : action.target);
+    if (query.empty()) return "你想问什么问题？";
+
+    std::string api_key = baidu_api_key();
+    if (api_key.empty()) {
+        fprintf(stderr, "[OpenDomainQA] Missing API key. Set BAIDU_AI_SEARCH_API_KEY.\n");
+        return "还没有配置百度搜索的 API Key。";
+    }
+
+    std::string source = extract_open_domain_source(action);
+    fprintf(stdout, "[OpenDomainQA] source=%s query=\"%s\"\n", source.c_str(), query.c_str());
+
+    std::string answer;
+    if (source == "baidu_baike") {
+        answer = baidu_baike_answer(query, api_key);
+        if (answer.empty()) {
+            answer = baidu_ai_search_answer(query + " 百度百科", "baidu_search", api_key);
+        }
+    } else {
+        answer = baidu_ai_search_answer(query, source, api_key);
+    }
+
+    if (answer.empty()) {
+        return "我没有查到可靠结果，你可以换个说法再问一次。";
+    }
+    return clean_spoken_answer(answer);
+}
+
 }
 
 SemanticEngine::SemanticEngine()
     : m_conversation(8) {
     // 初始化 Action 处理器为默认
-    for (int i = 0; i < 12; ++i) {
+    for (int i = 0; i < 13; ++i) {
         m_action_handlers[i] = nullptr;
     }
 }
@@ -405,9 +756,9 @@ bool SemanticEngine::init(const std::string& model_path,
         "使用结构化 ReAct：先规划 steps，再由程序执行每个 action，最后用 reply 做语音播报。\n"
         "JSON 字段固定为：reply, steps, confidence。\n"
         "steps 是数组，每个元素字段固定为：action, target, params, confidence。\n"
-        "action 只能是 open_app、search_web、get_weather、get_time、custom。无动作时 steps 为空数组。\n"
+        "action 只能是 open_app、search_web、get_weather、get_time、open_domain_qa、custom。无动作时 steps 为空数组。\n"
         "不允许输出 system_cmd。\n"
-        "reply 使用中文，必须适合最终语音播报，尽量控制在 20 个汉字以内。\n"
+        "reply 使用中文，必须适合最终语音播报；工具类动作尽量控制在 20 个汉字以内，开放域问答先回复“我查一下。”。\n"
         "params 如果没有额外参数就填空字符串。\n"
         "confidence 是 0 到 1 的数字。\n"
         "如果用户一句话里有多个明确任务，必须拆成多个 steps，并保持用户说话顺序。\n"
@@ -417,14 +768,19 @@ bool SemanticEngine::init(const std::string& model_path,
         "用户说\"帮我搜索 Python 教程\"，输出 {\"reply\":\"已搜索 Python 教程。\",\"steps\":[{\"action\":\"search_web\",\"target\":\"Python 教程\",\"params\":\"\",\"confidence\":0.95}],\"confidence\":0.95}\n"
         "用户说\"北京天气怎么样\"，输出 {\"reply\":\"查询北京天气。\",\"steps\":[{\"action\":\"get_weather\",\"target\":\"北京\",\"params\":\"\",\"confidence\":0.95}],\"confidence\":0.95}\n"
         "用户说\"打开计算器查上海天气\"，输出 {\"reply\":\"已打开计算器，并查询上海天气。\",\"steps\":[{\"action\":\"open_app\",\"target\":\"Calculator\",\"params\":\"\",\"confidence\":0.95},{\"action\":\"get_weather\",\"target\":\"上海\",\"params\":\"\",\"confidence\":0.95}],\"confidence\":0.95}\n"
+        "用户说\"量子计算是什么\"，输出 {\"reply\":\"我查一下。\",\"steps\":[{\"action\":\"open_domain_qa\",\"target\":\"量子计算是什么\",\"params\":\"source=baidu_baike\",\"confidence\":0.9}],\"confidence\":0.9}\n"
+        "用户说\"最近人工智能有什么新闻\"，输出 {\"reply\":\"我查一下最新消息。\",\"steps\":[{\"action\":\"open_domain_qa\",\"target\":\"最近人工智能有什么新闻\",\"params\":\"source=baidu_news\",\"confidence\":0.9}],\"confidence\":0.9}\n"
+        "用户说\"杭州有哪些好玩的地方\"，输出 {\"reply\":\"我查一下。\",\"steps\":[{\"action\":\"open_domain_qa\",\"target\":\"杭州有哪些好玩的地方\",\"params\":\"source=baidu_search\",\"confidence\":0.9}],\"confidence\":0.9}\n"
         "用户说\"现在几点了\"，输出 {\"reply\":\"我看看时间。\",\"steps\":[{\"action\":\"get_time\",\"target\":\"\",\"params\":\"\",\"confidence\":0.95}],\"confidence\":0.95}\n"
         "用户说\"你好\"，输出 {\"reply\":\"你好，我在。\",\"steps\":[],\"confidence\":0.9}\n"
         "\n"
         "注意：\n"
         "1. 必须准确理解用户意图，不要过度猜测\n"
         "2. 如果不确定，回复用户询问确认\n"
-        "3. 只有用户明确要求打开应用、搜索网页、查询天气、询问时间时才加入 step\n"
-        "4. 如果用户说\"结束\"或\"退出\"，只回复告别，steps 为空数组";
+        "3. 只有用户明确要求打开应用、搜索网页、查询天气、询问时间、查询事实知识或实时信息时才加入 step\n"
+        "4. 天气必须用 get_weather，不要用 open_domain_qa\n"
+        "5. 开放域问答包括百科解释、事实问答、旅游建议、新闻热点、最近/最新信息；百科解释 params 用 source=baidu_baike，新闻热点用 source=baidu_news，其他用 source=baidu_search\n"
+        "6. 如果用户说\"结束\"或\"退出\"，只回复告别，steps 为空数组";
 
     m_conversation.set_system_prompt(system_prompt);
 
@@ -529,6 +885,7 @@ void SemanticEngine::process_asr_result(const std::string& asr_text,
         // 这里只记录结构化日志并保持自定义 handler 兼容。
         std::vector<std::string> action_summaries;
         std::vector<std::string> weather_summaries;
+        std::vector<std::string> qa_summaries;
         for (auto action : plan.actions) {
             if (action.type == ActionType::NONE) continue;
             if (action.type == ActionType::GET_WEATHER) {
@@ -537,6 +894,12 @@ void SemanticEngine::process_asr_result(const std::string& asr_text,
                 action.params = weather_summary;
                 action.response_text.clear();
                 fprintf(stdout, "[Weather] %s\n", weather_summary.c_str());
+            } else if (action.type == ActionType::OPEN_DOMAIN_QA) {
+                std::string qa_answer = query_open_domain_answer(action);
+                qa_summaries.push_back(qa_answer);
+                action.params = qa_answer;
+                action.response_text.clear();
+                fprintf(stdout, "[OpenDomainQA] %s\n", qa_answer.c_str());
             } else {
                 std::string done = completed_text_for_action(action);
                 if (!done.empty()) {
@@ -549,13 +912,17 @@ void SemanticEngine::process_asr_result(const std::string& asr_text,
             }
         }
 
-        if (!weather_summaries.empty()) {
+        if (!action_summaries.empty() || !weather_summaries.empty() || !qa_summaries.empty()) {
             std::string combined;
             for (const auto& summary : action_summaries) {
                 if (!combined.empty()) combined += " ";
                 combined += summary;
             }
             for (const auto& summary : weather_summaries) {
+                if (!combined.empty()) combined += " ";
+                combined += summary;
+            }
+            for (const auto& summary : qa_summaries) {
                 if (!combined.empty()) combined += " ";
                 combined += summary;
             }
@@ -587,7 +954,7 @@ void SemanticEngine::process_asr_result(const std::string& asr_text,
 void SemanticEngine::set_action_handler(ActionType type, ActionCallback handler) {
     std::lock_guard<std::mutex> lock(m_handler_mutex);
     int idx = static_cast<int>(type);
-    if (idx >= 0 && idx < 12) {
+    if (idx >= 0 && idx < 13) {
         m_action_handlers[idx] = handler;
     }
 }
@@ -599,7 +966,7 @@ void SemanticEngine::dispatch_action(const Action& action) {
     // 自定义处理器
     std::lock_guard<std::mutex> lock(m_handler_mutex);
     int idx = static_cast<int>(action.type);
-    if (idx >= 0 && idx < 12 && m_action_handlers[idx]) {
+    if (idx >= 0 && idx < 13 && m_action_handlers[idx]) {
         m_action_handlers[idx](action);
     }
 }
@@ -695,11 +1062,12 @@ std::string SemanticEngine::build_prompt(const std::string& user_input) {
 void SemanticEngine::default_action_handler(const Action& action) {
     const char* type_names[] = {
         "NONE", "OPEN_APP", "SEARCH_WEB", "SEND_MESSAGE",
-        "GET_TIME", "SET_REMINDER", "PLAY_MUSIC", "GET_WEATHER", "SYSTEM_CMD", "CUSTOM"
+        "GET_TIME", "SET_REMINDER", "PLAY_MUSIC", "GET_WEATHER",
+        "OPEN_DOMAIN_QA", "SYSTEM_CMD", "CUSTOM"
     };
 
     int idx = static_cast<int>(action.type);
-    const char* type_name = (idx >= 0 && idx < 10) ? type_names[idx] : "UNKNOWN";
+    const char* type_name = (idx >= 0 && idx < 11) ? type_names[idx] : "UNKNOWN";
 
     fprintf(stdout, "[Action] type=%s action=\"%s\" target=\"%s\" params=\"%s\" response=\"%s\"\n",
             type_name,
