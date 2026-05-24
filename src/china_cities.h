@@ -1,3 +1,11 @@
+// ============================================================
+// 中国主要城市经纬度数据
+//
+// 用于天气查询场景下的城市名称定位：
+// - CHINA_CITIES[] 包含约 300+ 个中国城市的经纬度
+// - find_city() 支持精确匹配、遍历匹配和"XX市"后缀匹配
+// - 城市按拼音排序，支持二分查找
+// ============================================================
 #pragma once
 
 #include <string>
@@ -5,6 +13,7 @@
 #include <cstdint>
 #include <algorithm>
 
+// 城市经纬度结构体
 struct CityCoord {
     const char* name;       // 城市中文名
     double lat;             // 纬度
@@ -346,11 +355,12 @@ static constexpr CityCoord CHINA_CITIES[] = {
 
 static constexpr size_t CHINA_CITIES_COUNT = sizeof(CHINA_CITIES) / sizeof(CHINA_CITIES[0]);
 
-// 二分查找城市，返回索引；未找到返回 -1
+// 查找城市在表中的索引，未找到返回 -1
+// 查找策略：二分查找 → 线性遍历 → 去掉"市"后缀再查
 inline int find_city(const std::string& name) {
     if (name.empty()) return -1;
 
-    // 先尝试精确匹配
+    // 策略1：二分查找精确匹配
     int lo = 0, hi = (int)CHINA_CITIES_COUNT - 1;
     while (lo <= hi) {
         int mid = (lo + hi) / 2;
@@ -360,12 +370,12 @@ inline int find_city(const std::string& name) {
         else hi = mid - 1;
     }
 
-    // 精确匹配失败时，遍历匹配
+    // 策略2：二分失败时，线性遍历保护（处理非标准顺序字符串比较）
     for (size_t i = 0; i < CHINA_CITIES_COUNT; i++) {
         if (name == CHINA_CITIES[i].name) return (int)i;
     }
 
-    // 短名匹配：如果输入是"XX市"，去掉"市"再查
+    // 策略3：短名匹配——如果输入是"XX市"，去掉"市"后缀再查
     static const char* city_suffix = "\u5E02";  // "市"的UTF-8编码
     size_t suffix_len = 3;
     if (name.size() > suffix_len && name.substr(name.size() - suffix_len) == city_suffix) {

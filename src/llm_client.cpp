@@ -13,9 +13,18 @@ LlmClient::~LlmClient() {
     unload_model();
 }
 
+// ============================================================
+// 模型加载流程：
+// 1. 初始化 llama 后端
+// 2. 配置模型参数（内存映射、GPU 层数）
+// 3. 加载模型文件
+// 4. 获取词表（vocab）
+// 5. 创建推理上下文
+// ============================================================
 bool LlmClient::load_model(const std::string& model_path, int n_ctx, int n_threads, bool use_gpu) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
+    // 如果已有加载的模型，先卸载
     if (m_model) {
         unload_model_locked();
     }
@@ -25,27 +34,27 @@ bool LlmClient::load_model(const std::string& model_path, int n_ctx, int n_threa
     m_n_threads  = n_threads;
     m_use_gpu    = use_gpu;
 
-    // 1. 后端初始化
+    // 1. 后端初始化（全局，可多次调用）
     llama_backend_init();
 
     // 2. 模型参数 — n_gpu_layers 在这里设置
     auto model_params = llama_model_default_params();
-    model_params.use_mmap  = true;
-    model_params.use_mlock = false;
+    model_params.use_mmap  = true;   // 使用内存映射加速加载
+    model_params.use_mlock = false;  // 不锁定内存页
     if (use_gpu) {
         model_params.n_gpu_layers = -1;  // 全部层卸载到 GPU
     } else {
-        model_params.n_gpu_layers = 0;
+        model_params.n_gpu_layers = 0;   // 仅使用 CPU
     }
 
-    // 3. 加载模型
+    // 3. 加载模型文件
     m_model = llama_model_load_from_file(model_path.c_str(), model_params);
     if (!m_model) {
         fprintf(stderr, "[LLM] Failed to load model: %s\n", model_path.c_str());
         return false;
     }
 
-    // 4. 获取 vocab — const 指针，需要 const_cast
+    // 4. 获取 vocab — const 指针，需要 const_cast 转为可变指针
     const struct llama_vocab * vocab_const = llama_model_get_vocab(m_model);
     m_vocab = const_cast<struct llama_vocab *>(vocab_const);
     if (!m_vocab) {
@@ -55,15 +64,15 @@ bool LlmClient::load_model(const std::string& model_path, int n_ctx, int n_threa
         return false;
     }
 
-    // 5. 上下文参数 — 注意字段名已更新
+    // 5. 上下文参数 — 配置推理上下文大小、批处理、线程等
     auto ctx_params = llama_context_default_params();
-    ctx_params.n_ctx           = n_ctx;
-    ctx_params.n_batch         = 512;
-    ctx_params.n_ubatch        = 512;
-    ctx_params.n_threads       = n_threads;
-    ctx_params.n_threads_batch = n_threads;
-    ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
-    ctx_params.offload_kqv     = use_gpu;
+    ctx_params.n_ctx           = n_ctx;                        // 上下文窗口大小
+    ctx_params.n_batch         = 512;                          // 批处理大小
+    ctx_params.n_ubatch        = 512;                          // 微批处理大小
+    ctx_params.n_threads       = n_threads;                    // 推理线程数
+    ctx_params.n_threads_batch = n_threads;                    // 批处理线程数
+    ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;   // Flash Attention 自动模式
+    ctx_params.offload_kqv     = use_gpu;                      // 将 KQV 矩阵卸载到 GPU
 
     m_ctx = llama_init_from_model(m_model, ctx_params);
     if (!m_ctx) {
@@ -184,16 +193,27 @@ LlmResult LlmClient::infer_sync(const LlmInferenceParams& params) {
     return run_inference(params);
 }
 
+// ============================================================
+// 核心推理流程：
+// 1. Tokenize - 将文本 prompt 转换为 token ID 序列
+// 2. 上下文检查 - 确保 prompt + max_tokens 不超出上下文窗口
+// 3. 采样器链 - 配置 top-k/top-p/temperature/repeat_penalty 采样策略
+// 4. Prefill - 预填充阶段，一次性处理所有 prompt tokens
+// 5. 自回归生成 - 逐个 token 生成，直到 EOS 或达到 max_tokens
+// ============================================================
 LlmResult LlmClient::run_inference(const LlmInferenceParams& params) {
     LlmResult result;
     result.success = false;
 
-    auto t0 = std::chrono::high_resolution_clock::now();
+    auto t0 = std::chrono::high_resolution_clock::now();  // 开始计时
 
+    // 清空之前的推理内存，释放 KV cache
     llama_memory_clear(llama_get_memory(m_ctx), true);
 
-    // 1. Tokenize 输入 prompt
-    const int n_prompt_tokens = 1024;
+    // ============================================================
+    // 1. Tokenize 输入 prompt（文本 → token ID 序列）
+    // ============================================================
+    const int n_prompt_tokens = 1024;                       // 初始缓冲区大小
     std::vector<llama_token> prompt_tokens(n_prompt_tokens);
     int n_tokens = llama_tokenize(
         m_vocab,
@@ -201,12 +221,12 @@ LlmResult LlmClient::run_inference(const LlmInferenceParams& params) {
         (int)params.prompt.size(),
         prompt_tokens.data(),
         n_prompt_tokens,
-        true,   // add_special = true (add BOS)
-        true    // parse_special = true
+        true,   // add_special = true (添加 BOS 标记)
+        true    // parse_special = true (解析特殊 token)
     );
 
     if (n_tokens < 0) {
-        // 缓冲区不够大，重试
+        // 缓冲区不够大，根据返回值重新分配并重试
         prompt_tokens.resize(-n_tokens);
         n_tokens = llama_tokenize(
             m_vocab,
@@ -223,13 +243,16 @@ LlmResult LlmClient::run_inference(const LlmInferenceParams& params) {
         return result;
     }
 
-    prompt_tokens.resize(n_tokens);
+    prompt_tokens.resize(n_tokens);  // 调整为实际 token 数量
 
-    // 2. 检查上下文长度
-    int n_ctx_avail = llama_n_ctx(m_ctx);
+    // ============================================================
+    // 2. 检查上下文长度，必要时截断 prompt
+    // ============================================================
+    int n_ctx_avail = llama_n_ctx(m_ctx);  // 可用的上下文窗口大小
     if (n_tokens + params.max_tokens > n_ctx_avail) {
         fprintf(stderr, "[LLM] Warning: prompt (%d) + max_tokens (%d) > ctx (%d), truncating\n",
                 n_tokens, params.max_tokens, n_ctx_avail);
+        // 保留最近的 tokens，为生成预留空间
         const int keep_tokens = std::max(1, n_ctx_avail - params.max_tokens);
         if ((int)prompt_tokens.size() > keep_tokens) {
             prompt_tokens.erase(prompt_tokens.begin(), prompt_tokens.end() - keep_tokens);
@@ -237,9 +260,12 @@ LlmResult LlmClient::run_inference(const LlmInferenceParams& params) {
         }
     }
 
-    // 3. 创建 Sampler Chain
+    // ============================================================
+    // 3. 创建 Sampler Chain（采样策略链）
+    // 根据 temperature 决定使用贪婪解码还是随机采样
+    // ============================================================
     if (m_sampler) {
-        llama_sampler_free(m_sampler);
+        llama_sampler_free(m_sampler);  // 清理旧采样器
         m_sampler = nullptr;
     }
 
@@ -247,8 +273,10 @@ LlmResult LlmClient::run_inference(const LlmInferenceParams& params) {
     m_sampler = llama_sampler_chain_init(sparams);
 
     if (params.temperature < 0.01f) {
+        // 贪婪解码：每次选择概率最高的 token
         llama_sampler_chain_add(m_sampler, llama_sampler_init_greedy());
     } else {
+        // 随机采样链：top-k → top-p → temperature → repeat_penalty → 分布采样
         llama_sampler_chain_add(m_sampler, llama_sampler_init_top_k((int)params.top_k));
         llama_sampler_chain_add(m_sampler, llama_sampler_init_top_p(params.top_p, 1));
         llama_sampler_chain_add(m_sampler, llama_sampler_init_temp(params.temperature));
@@ -256,8 +284,11 @@ LlmResult LlmClient::run_inference(const LlmInferenceParams& params) {
         llama_sampler_chain_add(m_sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
     }
 
-    // 4. 解码 prompt (prefill)
-    const int n_batch = std::max(1, (int)llama_n_batch(m_ctx));
+    // ============================================================
+    // 4. 解码 prompt (Prefill 预填充阶段)
+    // 将所有 prompt tokens 一次性送入模型计算 KV cache
+    // ============================================================
+    const int n_batch = std::max(1, (int)llama_n_batch(m_ctx));  // 单批最大 token 数
     llama_batch batch{};
     for (int pos = 0; pos < n_tokens; pos += n_batch) {
         const int n_eval = std::min(n_batch, n_tokens - pos);
@@ -270,26 +301,30 @@ LlmResult LlmClient::run_inference(const LlmInferenceParams& params) {
         }
     }
 
-    // 5. 自回归生成
+    // ============================================================
+    // 5. 自回归生成（逐个 token 循环生成）
+    // 每次采样一个 token，将其附加到上下文，继续生成下一个
+    // ============================================================
     std::string output;
     int n_generated = 0;
     for (int i = 0; i < params.max_tokens; ++i) {
-        // 采样
+        // 采样下一个 token
         llama_token new_token_id = llama_sampler_sample(m_sampler, m_ctx, -1);
 
+        // 遇到 EOS（End of Sequence）则停止
         if (llama_vocab_is_eog(m_vocab, new_token_id)) {
-            break; // 遇到 EOS 停止
+            break;
         }
 
-        // 解码 token → text
+        // token ID → 文本片段
         char piece[32] = {0};
         int n_bytes = llama_token_to_piece(
             m_vocab,
             new_token_id,
             piece,
             sizeof(piece),
-            0,    // lstrip
-            true  // special
+            0,    // lstrip = 0，不从左侧去除空格
+            true  // special = true，包含特殊 token
         );
 
         if (n_bytes > 0) {
@@ -297,12 +332,13 @@ LlmResult LlmClient::run_inference(const LlmInferenceParams& params) {
             n_generated++;
         }
 
+        // 遇到 end_of_turn 标记或 markdown 代码块标记则提前停止
         if (output.find("<end_of_turn>") != std::string::npos ||
             output.find("```") != std::string::npos) {
             break;
         }
 
-        // 准备下一个 batch (单个 token)
+        // 将新生成的 token 送入模型进行下一轮计算
         batch = llama_batch_get_one(&new_token_id, 1);
         if (llama_decode(m_ctx, batch) != 0) {
             fprintf(stderr, "[LLM] Decode failed at token %d\n", i);
@@ -318,6 +354,7 @@ LlmResult LlmClient::run_inference(const LlmInferenceParams& params) {
     llama_sampler_free(m_sampler);
     m_sampler = nullptr;
 
+    // 计算耗时并填充结果
     auto t1 = std::chrono::high_resolution_clock::now();
     result.elapsed_ms  = std::chrono::duration<double, std::milli>(t1 - t0).count();
     result.success     = !output.empty();

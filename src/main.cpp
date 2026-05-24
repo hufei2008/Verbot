@@ -1,7 +1,12 @@
-#include "audio_recorder.h"
-#include "semantic_engine.h"
+// ============================================================
+// Verbot - 实时语音识别 + 语义理解系统入口
+// 功能：录音 → VAD语音活动检测 → Whisper语音识别 → LLM语义理解 → TTS语音合成
+// ============================================================
 
-#include "whisper.h"
+#include "audio_recorder.h"     // 音频采集模块
+#include "semantic_engine.h"    // 语义引擎（LLM + TTS）
+
+#include "whisper.h"            // Whisper 语音识别库
 
 #include <iostream>
 #include <cstdio>
@@ -20,7 +25,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 
-// ANSI colors
+// ANSI 终端颜色宏定义，用于彩色日志输出
 #define COLOR_CYAN    "\033[36m"
 #define COLOR_GREEN   "\033[32m"
 #define COLOR_YELLOW  "\033[33m"
@@ -30,18 +35,22 @@
 #define COLOR_RESET   "\033[0m"
 #define CLEAR_SCREEN  "\033[2J\033[H"
 
+// 音频处理常量：每帧512采样点（16kHz下约32ms），采样率16kHz
 constexpr int SAMPLES_PER_VAD_FRAME = 512;   // 32ms @16kHz
 constexpr int SAMPLE_RATE = 16000;
-constexpr bool VAD_DEBUG_LOG = false;
+constexpr bool VAD_DEBUG_LOG = false;        // VAD 调试日志开关
 
+// 全局退出标志：1 表示收到 SIGINT 信号，请求停止
 static volatile std::sig_atomic_t g_stop_requested = 0;
+// 优雅退出开关：仅在初始化完成后才启用，防止启动阶段误触发强制退出
 static volatile std::sig_atomic_t g_graceful_sigint_enabled = 0;
 
+    // SIGINT 信号处理函数（Ctrl+C）：首次按下优雅退出，再次按下强制退出
     static void handle_sigint(int) {
         if (!g_graceful_sigint_enabled || g_stop_requested) {
-            _exit(130);
+            _exit(130);  // 未启用优雅退出或已请求过，直接强制退出
         }
-        g_stop_requested = 1;
+        g_stop_requested = 1;  // 设置退出标志
     }
 
     // 安全退出辅助函数：跳过 Python/MLX 的 atexit/finalizer 链。
@@ -49,19 +58,25 @@ static volatile std::sig_atomic_t g_graceful_sigint_enabled = 0;
     // 进程收尾时触发 C 扩展析构并 crash。这里先 flush 日志，再直接
     // _exit，保留正常退出码。
     static void safe_exit(int code) {
-        fflush(nullptr);
-        _exit(code);
-        __builtin_unreachable();
+        fflush(nullptr);          // 刷新所有输出缓冲区
+        _exit(code);              // 直接系统调用退出，跳过 atexit
+        __builtin_unreachable();  // 标记不可达，辅助编译器优化
     }
 
-// 线程安全的环形缓冲
+// ============================================================
+// 线程安全的环形缓冲区（RingBuffer）
+// 用于录音线程与主线程之间的音频数据传输
+// push() 由录音回调线程调用，consume() 由主线程调用
+// ============================================================
 class RingBuffer {
 public:
+    // 向缓冲区尾部追加音频数据
     void push(const float* data, size_t n) {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_buffer.insert(m_buffer.end(), data, data + n);
     }
 
+    // 从缓冲区头部取出 n 个采样点数据
     size_t consume(std::vector<float>& out, size_t n) {
         std::lock_guard<std::mutex> lock(m_mutex);
         n = std::min(n, m_buffer.size());
@@ -71,20 +86,21 @@ public:
         return n;
     }
 
+    // 获取当前缓冲区中的数据量（采样点数）
     size_t size() {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_buffer.size();
     }
 
 private:
-    std::vector<float> m_buffer;
-    std::mutex m_mutex;
+    std::vector<float> m_buffer;  // 音频数据存储
+    std::mutex m_mutex;           // 互斥锁，保证线程安全
 };
 
-// 抑制 whisper/VAD 内部 debug 日志
+// 抑制 whisper/llama 内部 debug 日志输出的回调函数
 static void cb_log_disable(enum ggml_log_level, const char*, void*) {}
 
-// 获取当前时间字符串
+// 获取当前时间的 HH:MM:SS 格式字符串，用于日志时间戳
 static std::string current_time_str() {
     std::time_t t = std::time(nullptr);
     char buf[32];
@@ -92,7 +108,7 @@ static std::string current_time_str() {
     return std::string(buf);
 }
 
-// 计算 RMS 能量
+// 计算音频数据的 RMS（均方根）能量，衡量音量大小
 static float compute_rms(const float* data, size_t n) {
     float sum = 0.0f;
     for (size_t i = 0; i < n; ++i) {
@@ -101,7 +117,7 @@ static float compute_rms(const float* data, size_t n) {
     return std::sqrt(sum / n);
 }
 
-// 计算峰值幅度
+// 计算音频数据的峰值幅度（最大绝对值）
 static float compute_peak(const float* data, size_t n) {
     float peak = 0.0f;
     for (size_t i = 0; i < n; ++i) {
@@ -111,28 +127,32 @@ static float compute_peak(const float* data, size_t n) {
     return peak;
 }
 
+// 判断是否应跳过低质量语音片段
+// 规则：时长过短（<0.45s）或短且能量低（<0.85s, rms<0.016, peak<0.055）
 static bool should_skip_low_quality_segment(double durSec, float rms, float peak) {
     if (durSec < 0.45) return true;
     if (durSec < 0.85 && rms < 0.016f && peak < 0.055f) return true;
     return false;
 }
 
-// ★ 改进：简单高通 FIR 滤波器，滤除 80Hz 以下低频噪声（空调/风扇/风声）
+// 一阶高通 IIR 滤波器，滤除 cutoff Hz 以下的低频噪声（如空调、风扇、风声）
+// 参数：data - 输入输出音频数据；cutoff - 截止频率（Hz）；sampleRate - 采样率
 static void highpass_filter(std::vector<float>& data, float cutoff, int sampleRate) {
-    const float dt = 1.0f / sampleRate;
-    const float rc = 1.0f / (2.0f * M_PI * cutoff);
-    const float alpha = rc / (rc + dt);
+    const float dt = 1.0f / sampleRate;                    // 采样间隔
+    const float rc = 1.0f / (2.0f * M_PI * cutoff);        // RC 时间常数
+    const float alpha = rc / (rc + dt);                     // 滤波系数
 
     if (data.empty()) return;
 
-    float y_prev = data[0];
+    float y_prev = data[0];  // 前一输出值
     for (size_t i = 1; i < data.size(); ++i) {
-        float y = alpha * (y_prev + data[i] - data[i-1]);
+        float y = alpha * (y_prev + data[i] - data[i-1]);  // 一阶高通差分方程
         data[i] = y;
         y_prev = y;
     }
 }
 
+// 执行语义引擎输出的动作（打开应用、搜索网页、获取时间/天气等）
 static void execute_action(const Action& action) {
     switch (action.type) {
         case ActionType::OPEN_APP: {
