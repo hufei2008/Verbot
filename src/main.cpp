@@ -21,9 +21,12 @@
 #include <cstdlib>
 #include <future>
 #include <csignal>
+#include <cctype>
+#include <set>
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <curl/curl.h>
 
 // ANSI 终端颜色宏定义，用于彩色日志输出
 #define COLOR_CYAN    "\033[36m"
@@ -100,6 +103,734 @@ private:
 // 抑制 whisper/llama 内部 debug 日志输出的回调函数
 static void cb_log_disable(enum ggml_log_level, const char*, void*) {}
 
+static std::string shell_quote(const std::string& s) {
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') out += "'\\''";
+        else out += c;
+    }
+    out += "'";
+    return out;
+}
+
+static std::string applescript_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        if (c == '\\' || c == '"') out += '\\';
+        out += c;
+    }
+    return out;
+}
+
+static bool text_contains(const std::string& s, const std::string& needle) {
+    return s.find(needle) != std::string::npos;
+}
+
+static size_t curl_write_string(void* ptr, size_t size, size_t nmemb, void* userdata) {
+    auto* out = static_cast<std::string*>(userdata);
+    out->append(static_cast<char*>(ptr), size * nmemb);
+    return size * nmemb;
+}
+
+static std::string url_escape(const std::string& text) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return text;
+    char* escaped = curl_easy_escape(curl, text.c_str(), (int)text.size());
+    std::string out = escaped ? escaped : text;
+    if (escaped) curl_free(escaped);
+    curl_easy_cleanup(curl);
+    return out;
+}
+
+static std::string http_get(const std::string& url, long timeout_sec = 8) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return "";
+
+    std::string body;
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "User-Agent: Mozilla/5.0");
+    headers = curl_slist_append(headers, "Referer: https://music.163.com/");
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_string);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_sec);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
+    CURLcode res = curl_easy_perform(curl);
+
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
+        fprintf(stderr, "[NetEaseMusic] HTTP failed: code=%ld err=%s url=%s\n",
+                http_code, curl_easy_strerror(res), url.c_str());
+        return "";
+    }
+    return body;
+}
+
+static std::string http_redirect_location(const std::string& url, long timeout_sec = 3) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return "";
+
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "User-Agent: Mozilla/5.0");
+    headers = curl_slist_append(headers, "Referer: https://music.163.com/");
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_sec);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 2L);
+    CURLcode res = curl_easy_perform(curl);
+
+    char* redirect = nullptr;
+    curl_easy_getinfo(curl, CURLINFO_REDIRECT_URL, &redirect);
+    std::string out = (res == CURLE_OK && redirect) ? redirect : "";
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return out;
+}
+
+static std::vector<std::string> json_array_objects(const std::string& body,
+                                                   const std::string& key) {
+    std::vector<std::string> objects;
+    size_t songs_pos = body.find("\"" + key + "\"");
+    if (songs_pos == std::string::npos) return objects;
+
+    size_t array_start = body.find('[', songs_pos);
+    if (array_start == std::string::npos) return objects;
+
+    int array_depth = 0;
+    int object_depth = 0;
+    bool in_string = false;
+    bool escape = false;
+    size_t object_start = std::string::npos;
+
+    for (size_t i = array_start; i < body.size(); ++i) {
+        char c = body[i];
+        if (in_string) {
+            if (escape) {
+                escape = false;
+            } else if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if (c == '"') {
+            in_string = true;
+            continue;
+        }
+        if (c == '[') {
+            array_depth++;
+            continue;
+        }
+        if (c == ']') {
+            array_depth--;
+            if (array_depth == 0) break;
+            continue;
+        }
+        if (array_depth != 1) continue;
+
+        if (c == '{') {
+            if (object_depth == 0) object_start = i;
+            object_depth++;
+        } else if (c == '}') {
+            object_depth--;
+            if (object_depth == 0 && object_start != std::string::npos) {
+                objects.push_back(body.substr(object_start, i - object_start + 1));
+                object_start = std::string::npos;
+            }
+        }
+    }
+
+    return objects;
+}
+
+static std::string top_level_json_number(const std::string& json, const std::string& key) {
+    std::string needle = "\"" + key + "\"";
+    int depth = 0;
+    bool in_string = false;
+    bool escape = false;
+    for (size_t i = 0; i < json.size(); ++i) {
+        char c = json[i];
+        if (in_string) {
+            if (escape) {
+                escape = false;
+            } else if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            if (depth == 1 && json.compare(i, needle.size(), needle) == 0) {
+                size_t colon = json.find(':', i + needle.size());
+                if (colon == std::string::npos) return "";
+                size_t begin = json.find_first_of("0123456789", colon + 1);
+                if (begin == std::string::npos) return "";
+                size_t end = json.find_first_not_of("0123456789", begin);
+                return json.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+            }
+            in_string = true;
+        } else if (c == '{') {
+            depth++;
+        } else if (c == '}') {
+            depth--;
+        }
+    }
+    return "";
+}
+
+static std::string top_level_json_string(const std::string& json, const std::string& key) {
+    std::string needle = "\"" + key + "\"";
+    int depth = 0;
+    bool in_string = false;
+    bool escape = false;
+    for (size_t i = 0; i < json.size(); ++i) {
+        char c = json[i];
+        if (in_string) {
+            if (escape) {
+                escape = false;
+            } else if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            if (depth == 1 && json.compare(i, needle.size(), needle) == 0) {
+                size_t colon = json.find(':', i + needle.size());
+                if (colon == std::string::npos) return "";
+                size_t quote = json.find('"', colon + 1);
+                if (quote == std::string::npos) return "";
+
+                std::string out;
+                bool value_escape = false;
+                for (size_t j = quote + 1; j < json.size(); ++j) {
+                    char vc = json[j];
+                    if (value_escape) {
+                        switch (vc) {
+                            case 'n': out.push_back('\n'); break;
+                            case 'r': out.push_back('\r'); break;
+                            case 't': out.push_back('\t'); break;
+                            case '"': out.push_back('"'); break;
+                            case '\\': out.push_back('\\'); break;
+                            case '/': out.push_back('/'); break;
+                            default: out.push_back(vc); break;
+                        }
+                        value_escape = false;
+                    } else if (vc == '\\') {
+                        value_escape = true;
+                    } else if (vc == '"') {
+                        return out;
+                    } else {
+                        out.push_back(vc);
+                    }
+                }
+                return out;
+            }
+            in_string = true;
+        } else if (c == '{') {
+            depth++;
+        } else if (c == '}') {
+            depth--;
+        }
+    }
+    return "";
+}
+
+static bool netease_song_has_artist(const std::string& song_object, const std::string& artist) {
+    if (artist.empty()) return false;
+    // cloudsearch API 用 "ar"，旧 search API 用 "artists"
+    return (song_object.find("\"ar\"") != std::string::npos ||
+            song_object.find("\"artists\"") != std::string::npos) &&
+           song_object.find("\"name\":\"" + artist + "\"") != std::string::npos;
+}
+
+static std::string json_unescape_slashes(std::string s) {
+    size_t pos = 0;
+    while ((pos = s.find("\\/", pos)) != std::string::npos) {
+        s.replace(pos, 2, "/");
+        pos += 1;
+    }
+    return s;
+}
+
+static std::string netease_player_url(const std::string& song_id) {
+    if (song_id.empty()) return "";
+    std::string outer_url = "https://music.163.com/song/media/outer/url?id=" + song_id + ".mp3";
+    std::string redirect = http_redirect_location(outer_url, 2);
+    if (!redirect.empty() && redirect.find("/404") == std::string::npos) {
+        return redirect;
+    }
+    return "";
+}
+
+static std::string first_playable_song_id(const std::vector<std::string>& songs,
+                                          const std::string& preferred_artist = "") {
+    for (const auto& song : songs) {
+        if (!preferred_artist.empty() && !netease_song_has_artist(song, preferred_artist)) {
+            continue;
+        }
+        std::string id = top_level_json_number(song, "id");
+        if (!id.empty() && !netease_player_url(id).empty()) return id;
+    }
+
+    if (!preferred_artist.empty()) {
+        for (const auto& song : songs) {
+            std::string id = top_level_json_number(song, "id");
+            if (!id.empty() && !netease_player_url(id).empty()) return id;
+        }
+    }
+
+    return "";
+}
+
+static std::string first_netease_artist_id(const std::string& artist) {
+    std::string url = "https://music.163.com/api/cloudsearch/pc?s=" + url_escape(artist) +
+        "&type=100&offset=0&limit=5";
+    std::string body = http_get(url);
+    auto artists = json_array_objects(body, "artists");
+    if (artists.empty()) return "";
+
+    for (const auto& candidate : artists) {
+        if (candidate.find("\"name\":\"" + artist + "\"") != std::string::npos) {
+            std::string id = top_level_json_number(candidate, "id");
+            if (!id.empty()) return id;
+        }
+    }
+
+    return top_level_json_number(artists.front(), "id");
+}
+
+static std::string first_netease_artist_hot_song_id(const std::string& artist) {
+    std::string artist_id = first_netease_artist_id(artist);
+    if (artist_id.empty()) return "";
+
+    std::string url = "https://music.163.com/api/artist/" + artist_id;
+    std::string body = http_get(url);
+    auto songs = json_array_objects(body, "hotSongs");
+    if (songs.empty()) return "";
+
+    std::vector<std::string> non_live;
+    for (const auto& song : songs) {
+        if (song.find("(Live)") == std::string::npos && song.find("Live") == std::string::npos) {
+            non_live.push_back(song);
+        }
+    }
+
+    std::string id = first_playable_song_id(non_live, artist);
+    if (!id.empty()) return id;
+    return first_playable_song_id(songs, artist);
+}
+
+static std::string first_netease_song_id(const std::string& query,
+                                         const std::string& preferred_artist = "") {
+    std::string url = "https://music.163.com/api/cloudsearch/pc?s=" + url_escape(query) +
+        "&type=1&offset=0&limit=20";
+    std::string body = http_get(url);
+    fprintf(stdout, "[NetEaseMusic] Search response len=%zu\n", body.size());
+    if (!body.empty()) {
+        fprintf(stdout, "[NetEaseMusic] Response preview: %.400s\n", body.c_str());
+    }
+    auto songs = json_array_objects(body, "songs");
+    fprintf(stdout, "[NetEaseMusic] Found %zu songs for \"%s\"\n", songs.size(), query.c_str());
+    for (size_t i = 0; i < songs.size() && i < 5; ++i) {
+        std::string id = top_level_json_number(songs[i], "id");
+        fprintf(stdout, "[NetEaseMusic]   #%zu: id=%s raw=%.200s\n", i+1, id.c_str(), songs[i].c_str());
+    }
+    if (songs.empty()) return "";
+
+    // 优先匹配指定歌手的歌
+    if (!preferred_artist.empty()) {
+        for (const auto& song : songs) {
+            if (netease_song_has_artist(song, preferred_artist)) {
+                std::string id = top_level_json_number(song, "id");
+                if (!id.empty()) return id;
+            }
+        }
+    }
+
+    // 返回第一个结果
+    return top_level_json_number(songs.front(), "id");
+}
+
+struct MusicTrack {
+    std::string id;
+    std::string title;
+    std::string artist;
+    std::string audio_url;
+};
+
+static std::mutex g_music_mutex;
+static std::vector<MusicTrack> g_music_queue;
+static size_t g_music_index = 0;
+
+static std::vector<MusicTrack> playable_tracks_from_songs(const std::vector<std::string>& songs,
+                                                          const std::string& preferred_artist,
+                                                          size_t limit = 10,
+                                                          int max_playable_probes = 12) {
+    std::vector<MusicTrack> tracks;
+    std::set<std::string> seen_ids;
+    int probed = 0;
+
+    auto try_add = [&](const std::string& song) {
+        if (tracks.size() >= limit) return;
+        if (probed >= max_playable_probes) return;
+        std::string id = top_level_json_number(song, "id");
+        if (id.empty() || seen_ids.count(id)) return;
+
+        probed++;
+        std::string audio_url = netease_player_url(id);
+        if (audio_url.empty()) return;
+
+        MusicTrack track;
+        track.id = id;
+        track.title = top_level_json_string(song, "name");
+        track.artist = preferred_artist;
+        track.audio_url = audio_url;
+        tracks.push_back(track);
+        seen_ids.insert(id);
+    };
+
+    if (!preferred_artist.empty()) {
+        for (const auto& song : songs) {
+            if (netease_song_has_artist(song, preferred_artist)) {
+                try_add(song);
+            }
+        }
+    }
+
+    for (const auto& song : songs) {
+        try_add(song);
+    }
+
+    return tracks;
+}
+
+static std::vector<MusicTrack> search_netease_tracks(const std::string& query,
+                                                     const std::string& preferred_artist = "",
+                                                     int max_playable_probes = 12) {
+    std::string url = "https://music.163.com/api/cloudsearch/pc?s=" + url_escape(query) +
+        "&type=1&offset=0&limit=30";
+    std::string body = http_get(url);
+    auto songs = json_array_objects(body, "songs");
+    fprintf(stdout, "[NetEaseMusic] Search \"%s\" returned %zu songs\n", query.c_str(), songs.size());
+    return playable_tracks_from_songs(songs, preferred_artist, 10, max_playable_probes);
+}
+
+static std::vector<MusicTrack> artist_hot_tracks(const std::string& artist) {
+    // 网易云公开外链对很多大版权歌手官方曲库会直接返回 404。
+    // 歌手播放先找“歌手 + 歌曲/翻唱”的可播放音源，避免只打开 App 当前队列。
+    auto tracks = search_netease_tracks(artist + " 歌曲", "", 16);
+    if (!tracks.empty()) return tracks;
+
+    tracks = search_netease_tracks(artist + " 翻唱", "", 16);
+    if (!tracks.empty()) return tracks;
+
+    std::string artist_id = first_netease_artist_id(artist);
+    if (artist_id.empty()) return {};
+
+    std::string url = "https://music.163.com/api/artist/" + artist_id;
+    std::string body = http_get(url);
+    auto songs = json_array_objects(body, "hotSongs");
+    if (songs.empty()) return {};
+
+    std::vector<std::string> non_live;
+    for (const auto& song : songs) {
+        if (song.find("(Live)") == std::string::npos && song.find("Live") == std::string::npos) {
+            non_live.push_back(song);
+        }
+    }
+
+    tracks = playable_tracks_from_songs(non_live, artist, 10, 16);
+    if (tracks.empty()) {
+        tracks = playable_tracks_from_songs(songs, artist, 10, 16);
+    }
+    if (tracks.empty()) {
+        tracks = search_netease_tracks(artist, artist, 20);
+    }
+    return tracks;
+}
+
+static std::string music_file_path(const std::string& song_id) {
+    return "/tmp/verbot_netease_" + song_id + ".mp3";
+}
+
+static void stop_music_player_process() {
+    std::system("pkill -TERM -f 'ffplay .*music.126.net' >/dev/null 2>&1 || true");
+    std::system("pkill -TERM -f 'mpg123 .*music.126.net' >/dev/null 2>&1 || true");
+    std::system("pkill -TERM -f 'afplay /tmp/verbot_netease_' >/dev/null 2>&1 || true");
+}
+
+static void pause_music_player_process() {
+    std::system("pkill -STOP -f 'ffplay .*music.126.net' >/dev/null 2>&1 || true");
+    std::system("pkill -STOP -f 'mpg123 .*music.126.net' >/dev/null 2>&1 || true");
+    std::system("pkill -STOP -f 'afplay /tmp/verbot_netease_' >/dev/null 2>&1 || true");
+    fprintf(stdout, "[MusicPlayer] Paused\n");
+}
+
+static void resume_music_player_process() {
+    std::system("pkill -CONT -f 'ffplay .*music.126.net' >/dev/null 2>&1 || true");
+    std::system("pkill -CONT -f 'mpg123 .*music.126.net' >/dev/null 2>&1 || true");
+    std::system("pkill -CONT -f 'afplay /tmp/verbot_netease_' >/dev/null 2>&1 || true");
+    fprintf(stdout, "[MusicPlayer] Resumed\n");
+}
+
+static void play_music_track(const MusicTrack& track, size_t index, size_t total) {
+    if (track.id.empty() || track.audio_url.empty()) return;
+    std::string out_path = music_file_path(track.id);
+
+    stop_music_player_process();
+    std::string headers = "User-Agent: Mozilla/5.0\r\nReferer: https://music.163.com/\r\n";
+    std::string cache_cmd =
+        "curl -L --max-time 60 -A 'Mozilla/5.0' -e 'https://music.163.com/' " +
+        shell_quote(track.audio_url) + " -o " + shell_quote(out_path) +
+        " >/tmp/verbot_music_cache.log 2>&1 &";
+    std::string player_cmd =
+        "if command -v ffplay >/dev/null 2>&1; then "
+        "exec ffplay -nodisp -autoexit -loglevel error -headers " + shell_quote(headers) + " " + shell_quote(track.audio_url) + "; "
+        "elif command -v mpg123 >/dev/null 2>&1; then "
+        "exec mpg123 -q " + shell_quote(track.audio_url) + "; "
+        "else "
+        "curl -L --max-time 60 -A 'Mozilla/5.0' -e 'https://music.163.com/' " + shell_quote(track.audio_url) +
+        " -o " + shell_quote(out_path) + " && exec afplay " + shell_quote(out_path) + "; "
+        "fi";
+    std::string cmd =
+        "nohup sh -c " + shell_quote(cache_cmd + " " + player_cmd) +
+        " >/tmp/verbot_music_playback.log 2>&1 &";
+    std::system(cmd.c_str());
+    fprintf(stdout, "[MusicPlayer] Playing %zu/%zu: id=%s title=\"%s\" artist=\"%s\" file=%s\n",
+            index + 1, total, track.id.c_str(), track.title.c_str(), track.artist.c_str(), out_path.c_str());
+}
+
+static void set_music_queue_and_play(std::vector<MusicTrack> tracks) {
+    std::lock_guard<std::mutex> lock(g_music_mutex);
+    g_music_queue = std::move(tracks);
+    g_music_index = 0;
+    fprintf(stdout, "[MusicPlayer] Queue loaded: %zu tracks\n", g_music_queue.size());
+    if (!g_music_queue.empty()) {
+        play_music_track(g_music_queue[g_music_index], g_music_index, g_music_queue.size());
+    }
+}
+
+static void play_next_music_track() {
+    std::lock_guard<std::mutex> lock(g_music_mutex);
+    if (g_music_queue.empty()) {
+        fprintf(stderr, "[MusicPlayer] No queue for next track\n");
+        return;
+    }
+    g_music_index = (g_music_index + 1) % g_music_queue.size();
+    play_music_track(g_music_queue[g_music_index], g_music_index, g_music_queue.size());
+}
+
+static void play_previous_music_track() {
+    std::lock_guard<std::mutex> lock(g_music_mutex);
+    if (g_music_queue.empty()) {
+        fprintf(stderr, "[MusicPlayer] No queue for previous track\n");
+        return;
+    }
+    g_music_index = (g_music_index + g_music_queue.size() - 1) % g_music_queue.size();
+    play_music_track(g_music_queue[g_music_index], g_music_index, g_music_queue.size());
+}
+
+static std::string music_command_from_action(const Action& action) {
+    std::string p = action.params;
+    std::transform(p.begin(), p.end(), p.begin(), [](unsigned char c) {
+        return (char)std::tolower(c);
+    });
+
+    if (text_contains(p, "pause") || text_contains(p, "暂停")) return "pause";
+    if (text_contains(p, "resume") || text_contains(p, "continue") || text_contains(p, "继续")) return "resume";
+    if (text_contains(p, "next") || text_contains(p, "下一")) return "next";
+    if (text_contains(p, "previous") || text_contains(p, "prev") || text_contains(p, "上一")) return "previous";
+    if (text_contains(p, "stop") || text_contains(p, "停止") || text_contains(p, "关闭")) return "stop";
+    if (text_contains(p, "open") || text_contains(p, "打开")) return "open";
+    if (text_contains(p, "artist") || text_contains(p, "歌手")) return "artist_play";
+    return action.target.empty() ? "play" : "search_play";
+}
+
+static int run_applescript(const std::vector<std::string>& lines) {
+    std::string cmd = "osascript";
+    for (const auto& line : lines) {
+        cmd += " -e " + shell_quote(line);
+    }
+    return std::system(cmd.c_str());
+}
+
+static void activate_netease_music() {
+    std::system("open -a NeteaseMusic");
+}
+
+static void click_netease_control_menu(const std::string& item) {
+    run_applescript({
+        "tell application \"NeteaseMusic\" to activate",
+        "delay 0.2",
+        "tell application \"System Events\" to tell process \"NeteaseMusic\" to click menu item \"" +
+            applescript_escape(item) + "\" of menu 1 of menu bar item \"控制\" of menu bar 1"
+    });
+}
+
+static void click_netease_control_menu_any(const std::vector<std::string>& items) {
+    std::string script =
+        "tell application \"NeteaseMusic\" to activate\n"
+        "delay 0.2\n"
+        "tell application \"System Events\" to tell process \"NeteaseMusic\"\n";
+    for (const auto& item : items) {
+        script +=
+            "try\n"
+            "click menu item \"" + applescript_escape(item) + "\" of menu 1 of menu bar item \"控制\" of menu bar 1\n"
+            "return\n"
+            "end try\n";
+    }
+    script += "end tell";
+    run_applescript({script});
+}
+
+static std::string netease_play_pause_menu_state() {
+    std::string cmd =
+        "osascript -e " +
+        shell_quote("tell application \"System Events\" to tell process \"NeteaseMusic\" to get name of menu item 1 of menu 1 of menu bar item \"控制\" of menu bar 1");
+
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) return "";
+    char buf[256];
+    std::string out;
+    while (fgets(buf, sizeof(buf), pipe)) {
+        out += buf;
+    }
+    pclose(pipe);
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' ')) {
+        out.pop_back();
+    }
+    return out;
+}
+
+static void ensure_netease_playing() {
+    std::string first_state = netease_play_pause_menu_state();
+    fprintf(stdout, "[NetEaseMusic] control menu before ensure_playing: %s\n",
+            first_state.empty() ? "(unknown)" : first_state.c_str());
+
+    for (int attempt = 1; attempt <= 5; ++attempt) {
+        std::string state = netease_play_pause_menu_state();
+        if (state == "暂停") {
+            fprintf(stdout, "[NetEaseMusic] control menu after ensure_playing: %s\n", state.c_str());
+            return;
+        }
+
+        // Deep links sometimes need a moment before the player accepts Play.
+        std::this_thread::sleep_for(std::chrono::milliseconds(300 * attempt));
+        click_netease_control_menu_any({"播放"});
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+
+    std::string final_state = netease_play_pause_menu_state();
+    fprintf(stdout, "[NetEaseMusic] control menu after ensure_playing: %s\n",
+            final_state.empty() ? "(unknown)" : final_state.c_str());
+    if (final_state != "暂停") {
+        fprintf(stderr, "[NetEaseMusic] Failed to enter playing state after retries\n");
+    }
+}
+
+static bool netease_play_song_by_id(const std::string& song_id) {
+    if (song_id.empty()) return false;
+    std::string url = "orpheus://song/" + song_id;
+    fprintf(stdout, "[NetEaseMusic] Telling NeteaseMusic to open location: %s\n", url.c_str());
+    int ret = run_applescript({
+        "tell application \"NeteaseMusic\"",
+        "activate",
+        "delay 0.5",
+        "open location \"" + applescript_escape(url) + "\"",
+        "end tell"
+    });
+    fprintf(stdout, "[NetEaseMusic] AppleScript result: %d\n", ret);
+
+    if (ret != 0) {
+        fprintf(stdout, "[NetEaseMusic] AppleScript failed, trying open command\n");
+        std::system("open -a NeteaseMusic");
+        std::string cmd = "open " + shell_quote(url);
+        ret = std::system(cmd.c_str());
+        fprintf(stdout, "[NetEaseMusic] open command result: %d\n", ret);
+    }
+
+    // 最后的回退：浏览器打开
+    if (ret != 0) {
+        std::string web_url = "https://music.163.com/#/song?id=" + song_id;
+        fprintf(stdout, "[NetEaseMusic] orpheus failed, opening web: %s\n", web_url.c_str());
+        std::string cmd = "open " + shell_quote(web_url);
+        ret = std::system(cmd.c_str());
+        fprintf(stdout, "[NetEaseMusic] web open result: %d\n", ret);
+    }
+    return ret == 0;
+}
+
+static void execute_netease_music_action(const Action& action) {
+    std::string command = music_command_from_action(action);
+    std::string target = action.target;
+    if (target == "网易云音乐" || target == "NeteaseMusic" || target == "NetEase Cloud Music") {
+        target.clear();
+    }
+
+    printf("%s  ↪ NetEase Music command: %s target=\"%s\"%s\n",
+           COLOR_YELLOW, command.c_str(), target.c_str(), COLOR_RESET);
+
+    if (command == "open") {
+        activate_netease_music();
+        return;
+    }
+
+    if ((command == "search_play" || command == "artist_play") && !target.empty()) {
+        std::vector<MusicTrack> tracks = command == "artist_play"
+            ? artist_hot_tracks(target)
+            : search_netease_tracks(target);
+        if (!tracks.empty()) {
+            const std::string& song_id = tracks.front().id;
+            printf("%s  ↪ NetEase song id: %s%s\n",
+                   COLOR_YELLOW, song_id.c_str(), COLOR_RESET);
+            printf("%s  ↪ NetEase playable URL resolved%s\n", COLOR_YELLOW, COLOR_RESET);
+            set_music_queue_and_play(std::move(tracks));
+        } else {
+            fprintf(stderr, "[NetEaseMusic] No playable song found for query: %s\n", target.c_str());
+        }
+        return;
+    }
+
+    if (command == "next") {
+        play_next_music_track();
+        return;
+    }
+
+    if (command == "previous") {
+        play_previous_music_track();
+        return;
+    }
+
+    if (command == "pause" || command == "stop") {
+        if (command == "stop") {
+            stop_music_player_process();
+            fprintf(stdout, "[MusicPlayer] Stopped\n");
+        } else {
+            pause_music_player_process();
+        }
+        return;
+    }
+
+    resume_music_player_process();
+}
+
 // 获取当前时间的 HH:MM:SS 格式字符串，用于日志时间戳
 static std::string current_time_str() {
     std::time_t t = std::time(nullptr);
@@ -129,9 +860,10 @@ static float compute_peak(const float* data, size_t n) {
 
 // 判断是否应跳过低质量语音片段
 // 规则：时长过短（<0.45s）或短且能量低（<0.85s, rms<0.016, peak<0.055）
-static bool should_skip_low_quality_segment(double durSec, float rms, float peak) {
-    if (durSec < 0.45) return true;
-    if (durSec < 0.85 && rms < 0.016f && peak < 0.055f) return true;
+static bool should_skip_low_quality_segment(double durSec, float, float) {
+    // 只丢弃极短的片段（<0.3s），VAD 已经过滤了噪音，
+    // 不再用能量门槛，避免丢弃短指令（如"打开"、"好的"）
+    if (durSec < 0.30) return true;
     return false;
 }
 
@@ -190,6 +922,10 @@ static void execute_action(const Action& action) {
                    COLOR_RESET);
             break;
         }
+        case ActionType::PLAY_MUSIC: {
+            execute_netease_music_action(action);
+            break;
+        }
         default: {
             if (action.type != ActionType::NONE) {
                 printf("%s  ↪ (No safe handler for %s)%s\n",
@@ -207,12 +943,17 @@ static bool looks_like_asr_prompt_artifact(const std::string& text) {
     if (text == "嗯" || text == "嗯嗯" || text == "啊" || text == "哦") return true;
     if (text == "咳" || text == "咳咳" || text == "咳咳咳") return true;
     if (text == "哼" || text == "哼哼") return true;
+    // 精确匹配完整的 prompt 字符串，避免误判正常短指令（如"打开"、"他说"）
+    // initial_prompt 中的完整连续字符串才触发
     if (text.find("打开关闭保存删除复制粘贴撤回发送") != std::string::npos) return true;
-    if (text.find("请问有什么可以帮助你的") != std::string::npos &&
-        text.find("他说他们说") != std::string::npos) return true;
-    if (text.size() > 90 &&
-        text.find("今天天气很好") != std::string::npos &&
-        text.find("一二三四") != std::string::npos) return true;
+    // 仅当同时包含多个 prompt 特征字符串时才判定为 artifact
+    if (text.size() > 80 &&
+        (text.find("能不能要不要会不会可以不可以") != std::string::npos ||
+         text.find("今天天气很好请问有什么可以帮助你的") != std::string::npos)) {
+        if (text.find("一二三四") != std::string::npos ||
+            text.find("他说他们说") != std::string::npos) return true;
+    }
+    // 如果只是单个短 prompt 词被识别（如"打开"），不算 artifact
     return false;
 }
 
@@ -605,8 +1346,8 @@ int main(int argc, char ** argv) {
             wparams.language         = "zh";
             wparams.n_threads        = std::min(4, (int)std::thread::hardware_concurrency());
 
-            wparams.no_context       = true;
-            wparams.single_segment   = false;
+            wparams.no_context       = true;             // 每段语音独立识别，避免上一轮文本污染短指令
+            wparams.single_segment   = true;             // VAD 已经切成单条指令，减少短句被拆段和补字
             wparams.suppress_blank   = true;
             wparams.suppress_nst     = true;
 
@@ -620,16 +1361,15 @@ int main(int argc, char ** argv) {
             wparams.beam_search.beam_size = 7;
 
             const char * chinese_prompt_v2 =
-                "你好世界欢迎使用语音识别系统"
-                "一二三四五六七八九十百千万亿"
-                "今天天气很好请问有什么可以帮助你的"
-                "打开关闭保存删除复制粘贴撤回发送"
-                "他说她说他们说我们在你们他们在"
-                "能不能要不要会不会可以不可以";
+                "语音助手常用指令："
+                "播放周杰伦的歌，播放周杰伦歌曲，播放稻香，播放晴天，播放网易云音乐。"
+                "暂停音乐，继续播放，下一首，上一首，打开网易云音乐。"
+                "北京天气怎么样，上海天气怎么样，打开计算器，现在几点了。"
+                "你好，请问有什么可以帮助你的。";
 
             wparams.initial_prompt        = chinese_prompt_v2;
             wparams.carry_initial_prompt  = false;
-            wparams.audio_ctx             = 0;
+            wparams.audio_ctx             = 768;         // 提供约 1.5s encoder 上下文 padding，改善段首/段尾识别
             wparams.tdrz_enable           = false;
 
             whisper_vad_reset_state(vctx);
@@ -685,8 +1425,9 @@ int main(int argc, char ** argv) {
                     static std::string lastSubmittedText;
                     static auto lastSubmittedAt = std::chrono::steady_clock::now() - std::chrono::seconds(60);
                     auto now = std::chrono::steady_clock::now();
+                    // 5 秒内连续相同文本才跳过（而非 20 秒），允许用户重复指令
                     if (asr_text == lastSubmittedText &&
-                        now - lastSubmittedAt < std::chrono::seconds(20)) {
+                        now - lastSubmittedAt < std::chrono::seconds(5)) {
                         printf("%s⚠ [%s] Ignoring duplicate ASR: \"%s\"%s\n",
                                COLOR_YELLOW, current_time_str().c_str(),
                                asr_text.c_str(), COLOR_RESET);

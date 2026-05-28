@@ -1,5 +1,6 @@
 #include "semantic_engine.h"
 #include "china_cities.h"
+#include "music_intent.h"
 
 #include <cstdio>
 #include <cstring>
@@ -235,6 +236,10 @@ std::string spoken_text_for_action(const Action& action) {
     if (action.type == ActionType::GET_WEATHER && !action.target.empty()) {
         return "查" + action.target + "天气。";
     }
+    if (action.type == ActionType::PLAY_MUSIC) {
+        if (!action.target.empty() && action.target != "网易云音乐") return "播放" + action.target + "。";
+        return "播放音乐。";
+    }
     return action.response_text;
 }
 
@@ -425,6 +430,33 @@ std::string completed_text_for_action(const Action& action) {
     }
     if (action.type == ActionType::GET_TIME) {
         return current_time_summary();
+    }
+    if (action.type == ActionType::PLAY_MUSIC) {
+        std::string params = action.params;
+        std::transform(params.begin(), params.end(), params.begin(), [](unsigned char c) {
+            return (char)std::tolower(c);
+        });
+        if (params.find("pause") != std::string::npos || params.find("暂停") != std::string::npos) {
+            return "已暂停音乐。";
+        }
+        if (params.find("resume") != std::string::npos || params.find("continue") != std::string::npos ||
+            params.find("继续") != std::string::npos) {
+            return "继续播放音乐。";
+        }
+        if (params.find("next") != std::string::npos || params.find("下一") != std::string::npos) {
+            return "已切到下一首。";
+        }
+        if (params.find("previous") != std::string::npos || params.find("prev") != std::string::npos ||
+            params.find("上一") != std::string::npos) {
+            return "已切到上一首。";
+        }
+        if (params.find("open") != std::string::npos || params.find("打开") != std::string::npos) {
+            return "已打开网易云音乐。";
+        }
+        if (!action.target.empty() && action.target != "网易云音乐") {
+            return "开始播放" + action.target + "。";
+        }
+        return "开始播放音乐。";
     }
     return "";
 }
@@ -756,7 +788,7 @@ bool SemanticEngine::init(const std::string& model_path,
         "使用结构化 ReAct：先规划 steps，再由程序执行每个 action，最后用 reply 做语音播报。\n"
         "JSON 字段固定为：reply, steps, confidence。\n"
         "steps 是数组，每个元素字段固定为：action, target, params, confidence。\n"
-        "action 只能是 open_app、search_web、get_weather、get_time、open_domain_qa、custom。无动作时 steps 为空数组。\n"
+        "action 只能是 open_app、search_web、get_weather、get_time、play_music、open_domain_qa、custom。无动作时 steps 为空数组。\n"
         "不允许输出 system_cmd。\n"
         "reply 使用中文，必须适合最终语音播报；工具类动作尽量控制在 20 个汉字以内，开放域问答先回复“我查一下。”。\n"
         "params 如果没有额外参数就填空字符串。\n"
@@ -772,15 +804,22 @@ bool SemanticEngine::init(const std::string& model_path,
         "用户说\"最近人工智能有什么新闻\"，输出 {\"reply\":\"我查一下最新消息。\",\"steps\":[{\"action\":\"open_domain_qa\",\"target\":\"最近人工智能有什么新闻\",\"params\":\"source=baidu_news\",\"confidence\":0.9}],\"confidence\":0.9}\n"
         "用户说\"杭州有哪些好玩的地方\"，输出 {\"reply\":\"我查一下。\",\"steps\":[{\"action\":\"open_domain_qa\",\"target\":\"杭州有哪些好玩的地方\",\"params\":\"source=baidu_search\",\"confidence\":0.9}],\"confidence\":0.9}\n"
         "用户说\"现在几点了\"，输出 {\"reply\":\"我看看时间。\",\"steps\":[{\"action\":\"get_time\",\"target\":\"\",\"params\":\"\",\"confidence\":0.95}],\"confidence\":0.95}\n"
+        "用户说\"打开网易云音乐\"，输出 {\"reply\":\"已打开网易云音乐。\",\"steps\":[{\"action\":\"play_music\",\"target\":\"网易云音乐\",\"params\":\"command=open;provider=netease_app\",\"confidence\":0.95}],\"confidence\":0.95}\n"
+        "用户说\"播放音乐\"，输出 {\"reply\":\"好的，播放音乐。\",\"steps\":[{\"action\":\"play_music\",\"target\":\"\",\"params\":\"command=play;provider=netease_app\",\"confidence\":0.9}],\"confidence\":0.9}\n"
+        "用户说\"播放稻香\"，输出 {\"reply\":\"好的，播放稻香。\",\"steps\":[{\"action\":\"play_music\",\"target\":\"稻香\",\"params\":\"command=play;provider=netease_app\",\"confidence\":0.9}],\"confidence\":0.9}\n"
+        "用户说\"暂停音乐\"，输出 {\"reply\":\"已暂停。\",\"steps\":[{\"action\":\"play_music\",\"target\":\"\",\"params\":\"command=pause;provider=netease_app\",\"confidence\":0.95}],\"confidence\":0.95}\n"
+        "用户说\"继续播放\"，输出 {\"reply\":\"继续播放。\",\"steps\":[{\"action\":\"play_music\",\"target\":\"\",\"params\":\"command=resume;provider=netease_app\",\"confidence\":0.95}],\"confidence\":0.95}\n"
+        "用户说\"下一首\"，输出 {\"reply\":\"下一首。\",\"steps\":[{\"action\":\"play_music\",\"target\":\"\",\"params\":\"command=next;provider=netease_app\",\"confidence\":0.95}],\"confidence\":0.95}\n"
         "用户说\"你好\"，输出 {\"reply\":\"你好，我在。\",\"steps\":[],\"confidence\":0.9}\n"
         "\n"
         "注意：\n"
         "1. 必须准确理解用户意图，不要过度猜测\n"
         "2. 如果不确定，回复用户询问确认\n"
-        "3. 只有用户明确要求打开应用、搜索网页、查询天气、询问时间、查询事实知识或实时信息时才加入 step\n"
+        "3. 只有用户明确要求打开应用、搜索网页、查询天气、询问时间、播放或控制音乐、查询事实知识或实时信息时才加入 step\n"
         "4. 天气必须用 get_weather，不要用 open_domain_qa\n"
         "5. 开放域问答包括百科解释、事实问答、旅游建议、新闻热点、最近/最新信息；百科解释 params 用 source=baidu_baike，新闻热点用 source=baidu_news，其他用 source=baidu_search\n"
-        "6. 如果用户说\"结束\"或\"退出\"，只回复告别，steps 为空数组";
+        "6. 音乐相关指令必须用 play_music；target 填歌曲名、歌手名或网易云音乐，控制命令写入 params 的 command 字段\n"
+        "7. 如果用户说\"结束\"或\"退出\"，只回复告别，steps 为空数组";
 
     m_conversation.set_system_prompt(system_prompt);
 
@@ -847,6 +886,39 @@ void SemanticEngine::process_asr_result(const std::string& asr_text,
     if (asr_text.empty()) return;
 
     fprintf(stdout, "[SemanticEngine] Processing ASR: \"%s\"\n", asr_text.c_str());
+
+    TaskPlan fast_plan;
+    if (build_fast_music_plan(asr_text, fast_plan)) {
+        fprintf(stdout, "[SemanticEngine] Fast music path: target=\"%s\" params=\"%s\"\n",
+                fast_plan.actions.empty() ? "" : fast_plan.actions.front().target.c_str(),
+                fast_plan.actions.empty() ? "" : fast_plan.actions.front().params.c_str());
+
+        m_conversation.add_turn("user", asr_text);
+        if (!fast_plan.reply.empty()) {
+            m_conversation.add_turn("assistant", fast_plan.reply);
+        }
+
+        for (const auto& action : fast_plan.actions) {
+            dispatch_action(action);
+            if (callback) {
+                callback(action);
+            }
+        }
+
+        if (m_auto_speak && m_tts_initialized && !fast_plan.reply.empty()) {
+            speak(fast_plan.reply, m_default_spk_id);
+        }
+
+        if (callback) {
+            Action final_action;
+            final_action.type = ActionType::NONE;
+            final_action.action_name = "none";
+            final_action.response_text = fast_plan.reply;
+            final_action.confidence = fast_plan.confidence;
+            callback(final_action);
+        }
+        return;
+    }
 
     // 1. 将用户输入加入对话历史
     m_conversation.add_turn("user", asr_text);

@@ -116,10 +116,10 @@ int main(int argc, char ** argv) {
     wparams.language         = "zh";   // 中文识别
     wparams.n_threads        = std::min(4, (int)std::thread::hardware_concurrency());
     // 上下文和抑制
-    wparams.no_context       = false;             // 使用上下文
+    wparams.no_context       = true;              // 每段语音独立识别，避免上一轮文本污染短指令
     wparams.suppress_blank   = true;              // 抑制空白输出
     wparams.suppress_nst     = true;              // 抑制非语音 token
-    wparams.single_segment   = false;             // 允许分段
+    wparams.single_segment   = true;              // 测试单条指令时减少拆段和补字
     // 温度和采样
     wparams.temperature      = 0.0f;              // 贪婪解码（确定性输出）
     wparams.temperature_inc  = 0.4f;              // 温度递增步长（更快回退）
@@ -133,12 +133,11 @@ int main(int argc, char ** argv) {
 
     // 中文初始提示文本（提高低资源场景下的识别准确性）
     const char * chinese_prompt_v2 =
-        "你好世界欢迎使用语音识别系统"
-        "一二三四五六七八九十百千万亿"
-        "今天天气很好请问有什么可以帮助你的"
-        "打开关闭保存删除复制粘贴撤回发送"
-        "他说她说他们说我们在你们他们在"
-        "能不能要不要会不会可以不可以";
+        "语音助手常用指令："
+        "播放周杰伦的歌，播放周杰伦歌曲，播放稻香，播放晴天，播放网易云音乐。"
+        "暂停音乐，继续播放，下一首，上一首，打开网易云音乐。"
+        "北京天气怎么样，上海天气怎么样，打开计算器，现在几点了。"
+        "你好，请问有什么可以帮助你的。";
 
     wparams.initial_prompt  = chinese_prompt_v2;
     wparams.carry_initial_prompt = false;  // 不将初始提示带入后续段

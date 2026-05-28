@@ -55,6 +55,8 @@ add_executable(Verbot
     src/llm_task.h
     src/conversation.cpp
     src/conversation.h
+    src/music_intent.cpp
+    src/music_intent.h
     src/semantic_engine.cpp
     src/semantic_engine.h
     src/tts_engine.cpp
@@ -67,6 +69,7 @@ target_include_directories(Verbot PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/vendor/whisper.cpp/include
     ${CMAKE_SOURCE_DIR}/vendor/llama.cpp/include
+    ${CMAKE_SOURCE_DIR}/vendor/llama.cpp/ggml/include
     ${TTS_PYTHON_PREFIX}/include/python3.10
     ${TTS_PYTHON_PREFIX}/lib/python3.10/site-packages/numpy/core/include
 )
@@ -112,6 +115,24 @@ target_include_directories(test_whisper PRIVATE
 
 target_link_libraries(test_whisper PRIVATE
     whisper
+)
+
+# ════════════════════════════════════════
+# 4.1 音乐语义解析测试
+# ════════════════════════════════════════
+add_executable(test_music_intent
+    src/test_music_intent.cpp
+    src/music_intent.cpp
+    src/music_intent.h
+)
+
+target_include_directories(test_music_intent PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/vendor/whisper.cpp/include
+    ${CMAKE_SOURCE_DIR}/vendor/llama.cpp/include
+    ${CMAKE_SOURCE_DIR}/vendor/llama.cpp/ggml/include
+    ${TTS_PYTHON_PREFIX}/include/python3.10
+    ${TTS_PYTHON_PREFIX}/lib/python3.10/site-packages/numpy/core/include
 )
 
 # ════════════════════════════════════════
