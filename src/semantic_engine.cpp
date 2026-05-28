@@ -905,7 +905,15 @@ void SemanticEngine::process_asr_result(const std::string& asr_text,
             }
         }
 
-        if (m_auto_speak && m_tts_initialized && !fast_plan.reply.empty()) {
+        bool has_music_action = false;
+        for (const auto& action : fast_plan.actions) {
+            if (action.type == ActionType::PLAY_MUSIC) {
+                has_music_action = true;
+                break;
+            }
+        }
+
+        if (!has_music_action && m_auto_speak && m_tts_initialized && !fast_plan.reply.empty()) {
             speak(fast_plan.reply, m_default_spk_id);
         }
 

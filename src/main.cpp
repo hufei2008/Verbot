@@ -23,6 +23,7 @@
 #include <csignal>
 #include <cctype>
 #include <set>
+#include <unordered_map>
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -175,7 +176,7 @@ static std::string http_get(const std::string& url, long timeout_sec = 8) {
     return body;
 }
 
-static std::string http_redirect_location(const std::string& url, long timeout_sec = 3) {
+static std::string http_redirect_location(const std::string& url, long timeout_ms = 1500) {
     CURL* curl = curl_easy_init();
     if (!curl) return "";
 
@@ -187,8 +188,8 @@ static std::string http_redirect_location(const std::string& url, long timeout_s
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_sec);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 2L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 800L);
     CURLcode res = curl_easy_perform(curl);
 
     char* redirect = nullptr;
@@ -369,15 +370,7 @@ static std::string json_unescape_slashes(std::string s) {
     return s;
 }
 
-static std::string netease_player_url(const std::string& song_id) {
-    if (song_id.empty()) return "";
-    std::string outer_url = "https://music.163.com/song/media/outer/url?id=" + song_id + ".mp3";
-    std::string redirect = http_redirect_location(outer_url, 2);
-    if (!redirect.empty() && redirect.find("/404") == std::string::npos) {
-        return redirect;
-    }
-    return "";
-}
+static std::string netease_player_url(const std::string& song_id);
 
 static std::string first_playable_song_id(const std::vector<std::string>& songs,
                                           const std::string& preferred_artist = "") {
@@ -479,6 +472,32 @@ static std::mutex g_music_mutex;
 static std::vector<MusicTrack> g_music_queue;
 static size_t g_music_index = 0;
 
+static std::mutex g_netease_cache_mutex;
+static std::unordered_map<std::string, std::string> g_netease_url_cache;
+static std::unordered_map<std::string, std::vector<MusicTrack>> g_netease_track_cache;
+
+static std::string netease_player_url(const std::string& song_id) {
+    if (song_id.empty()) return "";
+
+    {
+        std::lock_guard<std::mutex> lock(g_netease_cache_mutex);
+        auto it = g_netease_url_cache.find(song_id);
+        if (it != g_netease_url_cache.end()) return it->second;
+    }
+
+    std::string outer_url = "https://music.163.com/song/media/outer/url?id=" + song_id + ".mp3";
+    std::string redirect = http_redirect_location(outer_url, 1500);
+    std::string playable = (!redirect.empty() && redirect.find("/404") == std::string::npos)
+        ? redirect
+        : "";
+
+    {
+        std::lock_guard<std::mutex> lock(g_netease_cache_mutex);
+        g_netease_url_cache[song_id] = playable;
+    }
+    return playable;
+}
+
 static std::vector<MusicTrack> playable_tracks_from_songs(const std::vector<std::string>& songs,
                                                           const std::string& preferred_artist,
                                                           size_t limit = 10,
@@ -524,21 +543,42 @@ static std::vector<MusicTrack> playable_tracks_from_songs(const std::vector<std:
 static std::vector<MusicTrack> search_netease_tracks(const std::string& query,
                                                      const std::string& preferred_artist = "",
                                                      int max_playable_probes = 12) {
+    std::string cache_key = query + "\n" + preferred_artist + "\n" + std::to_string(max_playable_probes);
+    {
+        std::lock_guard<std::mutex> lock(g_netease_cache_mutex);
+        auto it = g_netease_track_cache.find(cache_key);
+        if (it != g_netease_track_cache.end()) {
+            fprintf(stdout, "[NetEaseMusic] Search cache hit: \"%s\" -> %zu tracks\n",
+                    query.c_str(), it->second.size());
+            return it->second;
+        }
+    }
+
+    auto started = std::chrono::steady_clock::now();
     std::string url = "https://music.163.com/api/cloudsearch/pc?s=" + url_escape(query) +
         "&type=1&offset=0&limit=30";
     std::string body = http_get(url);
     auto songs = json_array_objects(body, "songs");
-    fprintf(stdout, "[NetEaseMusic] Search \"%s\" returned %zu songs\n", query.c_str(), songs.size());
-    return playable_tracks_from_songs(songs, preferred_artist, 10, max_playable_probes);
+    auto tracks = playable_tracks_from_songs(songs, preferred_artist, 10, max_playable_probes);
+    double elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - started).count();
+    fprintf(stdout, "[NetEaseMusic] Search \"%s\" returned %zu songs, %zu playable tracks in %.0fms\n",
+            query.c_str(), songs.size(), tracks.size(), elapsed_ms);
+
+    {
+        std::lock_guard<std::mutex> lock(g_netease_cache_mutex);
+        g_netease_track_cache[cache_key] = tracks;
+    }
+    return tracks;
 }
 
 static std::vector<MusicTrack> artist_hot_tracks(const std::string& artist) {
     // 网易云公开外链对很多大版权歌手官方曲库会直接返回 404。
-    // 歌手播放先找“歌手 + 歌曲/翻唱”的可播放音源，避免只打开 App 当前队列。
-    auto tracks = search_netease_tracks(artist + " 歌曲", "", 16);
+    // 歌手播放先找“歌手 + 翻唱/歌曲”的可播放音源，避免只打开 App 当前队列。
+    auto tracks = search_netease_tracks(artist + " 翻唱", "", 8);
     if (!tracks.empty()) return tracks;
 
-    tracks = search_netease_tracks(artist + " 翻唱", "", 16);
+    tracks = search_netease_tracks(artist + " 歌曲", "", 12);
     if (!tracks.empty()) return tracks;
 
     std::string artist_id = first_netease_artist_id(artist);
