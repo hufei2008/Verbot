@@ -503,38 +503,47 @@ static std::vector<MusicTrack> playable_tracks_from_songs(const std::vector<std:
                                                           size_t limit = 10,
                                                           int max_playable_probes = 12) {
     std::vector<MusicTrack> tracks;
+    std::vector<std::pair<std::string, std::string>> candidates;
     std::set<std::string> seen_ids;
-    int probed = 0;
 
-    auto try_add = [&](const std::string& song) {
-        if (tracks.size() >= limit) return;
-        if (probed >= max_playable_probes) return;
+    auto add_candidate = [&](const std::string& song) {
+        if ((int)candidates.size() >= max_playable_probes) return;
         std::string id = top_level_json_number(song, "id");
         if (id.empty() || seen_ids.count(id)) return;
-
-        probed++;
-        std::string audio_url = netease_player_url(id);
-        if (audio_url.empty()) return;
-
-        MusicTrack track;
-        track.id = id;
-        track.title = top_level_json_string(song, "name");
-        track.artist = preferred_artist;
-        track.audio_url = audio_url;
-        tracks.push_back(track);
+        candidates.push_back({song, id});
         seen_ids.insert(id);
     };
 
     if (!preferred_artist.empty()) {
         for (const auto& song : songs) {
             if (netease_song_has_artist(song, preferred_artist)) {
-                try_add(song);
+                add_candidate(song);
             }
         }
     }
 
     for (const auto& song : songs) {
-        try_add(song);
+        add_candidate(song);
+    }
+
+    std::vector<std::future<std::string>> futures;
+    futures.reserve(candidates.size());
+    for (const auto& candidate : candidates) {
+        futures.push_back(std::async(std::launch::async, [id = candidate.second]() {
+            return netease_player_url(id);
+        }));
+    }
+
+    for (size_t i = 0; i < candidates.size() && tracks.size() < limit; ++i) {
+        std::string audio_url = futures[i].get();
+        if (audio_url.empty()) continue;
+
+        MusicTrack track;
+        track.id = candidates[i].second;
+        track.title = top_level_json_string(candidates[i].first, "name");
+        track.artist = preferred_artist;
+        track.audio_url = audio_url;
+        tracks.push_back(track);
     }
 
     return tracks;
@@ -1162,9 +1171,9 @@ int main(int argc, char ** argv) {
 
     // VAD 参数
     struct whisper_vad_params vad_params = whisper_vad_default_params();
-    vad_params.threshold               = 0.7f;   // 提高概率阈值，减少噪音误触发
+    vad_params.threshold               = 1.0f;   // 最高概率阈值，最大限度减少噪音误触发
     vad_params.min_speech_duration_ms  = 300;    // 增加最小语音持续时长
-    vad_params.min_silence_duration_ms = 400;    // 增加沉默判定时长
+    vad_params.min_silence_duration_ms = 700;    // 增加沉默判定时长
     vad_params.speech_pad_ms           = 200;
 
     printf("%s[%s] VAD params: thr=%.1f, min_speech=%dms, min_silence=%dms, pad=%dms%s\n",

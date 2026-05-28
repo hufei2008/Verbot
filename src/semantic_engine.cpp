@@ -509,9 +509,7 @@ std::string query_weather_summary(const std::string& target) {
 }
 
 std::string baidu_api_key() {
-    static const char* kBaiduAiSearchApiKeyFallback =
-        "bce-v3/ALTAK-ndZE5c6FneGJnHthA8N9p/632734f2b9d262c7ae706ca6a76c2df7254ebe3f";
-
+    // 优先从环境变量读取：BAIDU_AI_SEARCH_API_KEY > BAIDU_API_KEY > QIANFAN_API_KEY
     const char* key = std::getenv("BAIDU_AI_SEARCH_API_KEY");
     if (!key || !key[0]) key = std::getenv("BAIDU_API_KEY");
     if (!key || !key[0]) key = std::getenv("QIANFAN_API_KEY");
@@ -520,6 +518,7 @@ std::string baidu_api_key() {
         return value;
     }
 
+    // 从本地配置文件读取（不得提交到 Git）
     auto read_key_file = [](const std::string& path) -> std::string {
         std::ifstream in(path);
         if (!in.is_open()) return "";
@@ -567,7 +566,10 @@ std::string baidu_api_key() {
         }
     }
 
-    return kBaiduAiSearchApiKeyFallback;
+    // 注意：不要在此处硬编码 API Key fallback！
+    // 密钥应从环境变量 BAIDU_AI_SEARCH_API_KEY 或配置文件 config/baidu_api_key.txt 提供。
+    // 硬编码密钥会导致 secret 泄漏（已被 Git 历史记录捕获的风险）。
+    return "";
 }
 
 std::string extract_open_domain_source(const Action& action) {
