@@ -845,6 +845,11 @@ static void execute_netease_music_action(const Action& action) {
         std::vector<MusicTrack> tracks = command == "artist_play"
             ? artist_hot_tracks(target)
             : search_netease_tracks(target);
+        if (tracks.empty() && command == "search_play") {
+            fprintf(stdout, "[NetEaseMusic] Song search empty, fallback to artist_play: %s\n",
+                    target.c_str());
+            tracks = artist_hot_tracks(target);
+        }
         if (!tracks.empty()) {
             const std::string& song_id = tracks.front().id;
             printf("%s  ↪ NetEase song id: %s%s\n",
@@ -1401,24 +1406,21 @@ int main(int argc, char ** argv) {
             wparams.suppress_nst     = true;
 
             wparams.temperature      = 0.0f;
-            wparams.temperature_inc  = 0.4f;
+            wparams.temperature_inc  = 0.0f;             // 不做高温 fallback，减少噪音段幻听和重试耗时
             wparams.entropy_thold    = 1.2f;
             wparams.logprob_thold    = -1.0f;
-            wparams.no_speech_thold  = 0.5f;
+            wparams.no_speech_thold  = 0.4f;
             wparams.max_len          = 40;
 
-            wparams.beam_search.beam_size = 7;
+            wparams.beam_search.beam_size = 5;           // 兼顾准确率和短指令延迟
 
             const char * chinese_prompt_v2 =
-                "语音助手常用指令："
-                "播放周杰伦的歌，播放周杰伦歌曲，播放稻香，播放晴天，播放网易云音乐。"
-                "暂停音乐，继续播放，下一首，上一首，打开网易云音乐。"
-                "北京天气怎么样，上海天气怎么样，打开计算器，现在几点了。"
-                "你好，请问有什么可以帮助你的。";
+                "播放周杰伦的歌，播放稻香，播放晴天，暂停音乐，继续播放，下一首，上一首，"
+                "北京天气，上海天气，深圳天气，天津天气，打开计算器，现在几点。";
 
             wparams.initial_prompt        = chinese_prompt_v2;
             wparams.carry_initial_prompt  = false;
-            wparams.audio_ctx             = 768;         // 提供约 1.5s encoder 上下文 padding，改善段首/段尾识别
+            wparams.audio_ctx             = 512;         // 缩短音频上下文，降低短指令识别延迟
             wparams.tdrz_enable           = false;
 
             whisper_vad_reset_state(vctx);

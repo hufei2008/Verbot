@@ -809,6 +809,7 @@ bool SemanticEngine::init(const std::string& model_path,
         "用户说\"打开网易云音乐\"，输出 {\"reply\":\"已打开网易云音乐。\",\"steps\":[{\"action\":\"play_music\",\"target\":\"网易云音乐\",\"params\":\"command=open;provider=netease_app\",\"confidence\":0.95}],\"confidence\":0.95}\n"
         "用户说\"播放音乐\"，输出 {\"reply\":\"好的，播放音乐。\",\"steps\":[{\"action\":\"play_music\",\"target\":\"\",\"params\":\"command=play;provider=netease_app\",\"confidence\":0.9}],\"confidence\":0.9}\n"
         "用户说\"播放稻香\"，输出 {\"reply\":\"好的，播放稻香。\",\"steps\":[{\"action\":\"play_music\",\"target\":\"稻香\",\"params\":\"command=play;provider=netease_app\",\"confidence\":0.9}],\"confidence\":0.9}\n"
+        "用户说\"我要听周杰伦的歌\"，输出 {\"reply\":\"好的，播放周杰伦的歌。\",\"steps\":[{\"action\":\"play_music\",\"target\":\"周杰伦\",\"params\":\"command=artist_play;provider=netease_app\",\"confidence\":0.95}],\"confidence\":0.95}\n"
         "用户说\"暂停音乐\"，输出 {\"reply\":\"已暂停。\",\"steps\":[{\"action\":\"play_music\",\"target\":\"\",\"params\":\"command=pause;provider=netease_app\",\"confidence\":0.95}],\"confidence\":0.95}\n"
         "用户说\"继续播放\"，输出 {\"reply\":\"继续播放。\",\"steps\":[{\"action\":\"play_music\",\"target\":\"\",\"params\":\"command=resume;provider=netease_app\",\"confidence\":0.95}],\"confidence\":0.95}\n"
         "用户说\"下一首\"，输出 {\"reply\":\"下一首。\",\"steps\":[{\"action\":\"play_music\",\"target\":\"\",\"params\":\"command=next;provider=netease_app\",\"confidence\":0.95}],\"confidence\":0.95}\n"
@@ -820,7 +821,7 @@ bool SemanticEngine::init(const std::string& model_path,
         "3. 只有用户明确要求打开应用、搜索网页、查询天气、询问时间、播放或控制音乐、查询事实知识或实时信息时才加入 step\n"
         "4. 天气必须用 get_weather，不要用 open_domain_qa\n"
         "5. 开放域问答包括百科解释、事实问答、旅游建议、新闻热点、最近/最新信息；百科解释 params 用 source=baidu_baike，新闻热点用 source=baidu_news，其他用 source=baidu_search\n"
-        "6. 音乐相关指令必须用 play_music；target 填歌曲名、歌手名或网易云音乐，控制命令写入 params 的 command 字段\n"
+        "6. 音乐相关指令必须用 play_music；target 填歌曲名、歌手名或网易云音乐，控制命令写入 params 的 command 字段。用户说\"想听/我要听/播放/放一下 + 歌手 + 的歌/歌曲/音乐\"时，必须使用 command=artist_play，target 只填歌手名；用户说具体歌名时才使用 command=play\n"
         "7. 如果用户说\"结束\"或\"退出\"，只回复告别，steps 为空数组";
 
     m_conversation.set_system_prompt(system_prompt);
@@ -1016,7 +1017,14 @@ void SemanticEngine::process_asr_result(const std::string& asr_text,
         if (spoken_text.empty() && plan.actions.size() == 1) {
             spoken_text = spoken_text_for_action(plan.actions.front());
         }
-        if (m_auto_speak && m_tts_initialized && !spoken_text.empty()) {
+        bool has_music_action = false;
+        for (const auto& action : plan.actions) {
+            if (action.type == ActionType::PLAY_MUSIC) {
+                has_music_action = true;
+                break;
+            }
+        }
+        if (!has_music_action && m_auto_speak && m_tts_initialized && !spoken_text.empty()) {
             speak(spoken_text, m_default_spk_id);
         }
 

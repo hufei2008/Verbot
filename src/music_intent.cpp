@@ -134,12 +134,20 @@ bool build_fast_music_plan(const std::string& asr_text, TaskPlan& plan) {
     } else if (text == "播放音乐" || text == "放音乐") {
         action.params = "command=play;provider=netease_app";
         plan.reply = "开始播放音乐。";
-    } else if (starts_with(text, "播放") || starts_with(text, "放一下") || starts_with(text, "放一首")) {
+    } else if (starts_with(text, "播放") || starts_with(text, "放一下") || starts_with(text, "放一首") ||
+               starts_with(text, "我要听") || starts_with(text, "我想听") ||
+               starts_with(text, "想听") || starts_with(text, "听一下") ||
+               starts_with(text, "听一首")) {
         // 提取播放目标（歌手名或歌曲名）
         std::string target = text;
         if (starts_with(target, "播放")) target = target.substr(std::string("播放").size());
         else if (starts_with(target, "放一下")) target = target.substr(std::string("放一下").size());
         else if (starts_with(target, "放一首")) target = target.substr(std::string("放一首").size());
+        else if (starts_with(target, "我要听")) target = target.substr(std::string("我要听").size());
+        else if (starts_with(target, "我想听")) target = target.substr(std::string("我想听").size());
+        else if (starts_with(target, "想听")) target = target.substr(std::string("想听").size());
+        else if (starts_with(target, "听一下")) target = target.substr(std::string("听一下").size());
+        else if (starts_with(target, "听一首")) target = target.substr(std::string("听一首").size());
 
         const bool artist_request = is_artist_music_request(text);
         target = strip_music_artist_suffix(target);
