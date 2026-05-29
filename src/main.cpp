@@ -5,6 +5,7 @@
 
 #include "audio_recorder.h"     // 音频采集模块
 #include "semantic_engine.h"    // 语义引擎（LLM + TTS）
+#include "asr_rejector.h"       // ASR 文本拒识
 
 #include "whisper.h"            // Whisper 语音识别库
 
@@ -22,6 +23,10 @@
 #include <future>
 #include <csignal>
 #include <cctype>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <filesystem>
 #include <set>
 #include <unordered_map>
 #include <unistd.h>
@@ -841,6 +846,11 @@ static void execute_netease_music_action(const Action& action) {
         return;
     }
 
+    if ((command == "play" || command == "search_play") && target.empty()) {
+        fprintf(stdout, "[MusicPlayer] Empty play command ignored; ask user for a song or artist\n");
+        return;
+    }
+
     if ((command == "search_play" || command == "artist_play") && !target.empty()) {
         std::vector<MusicTrack> tracks = command == "artist_play"
             ? artist_hot_tracks(target)
@@ -892,6 +902,142 @@ static std::string current_time_str() {
     std::strftime(buf, sizeof(buf), "%H:%M:%S", std::localtime(&t));
     return std::string(buf);
 }
+
+static std::string debug_timestamp_for_filename() {
+    std::time_t t = std::time(nullptr);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", std::localtime(&t));
+    return std::string(buf);
+}
+
+static std::string trim_copy(std::string s) {
+    auto is_ws = [](unsigned char c) {
+        return c == ' ' || c == '\n' || c == '\r' || c == '\t';
+    };
+    while (!s.empty() && is_ws((unsigned char)s.front())) s.erase(s.begin());
+    while (!s.empty() && is_ws((unsigned char)s.back())) s.pop_back();
+    return s;
+}
+
+static std::string sanitize_debug_filename(std::string text) {
+    text = trim_copy(text);
+    if (text.empty()) text = "empty";
+
+    std::string out;
+    out.reserve(text.size());
+    for (unsigned char c : text) {
+        if (c < 0x20 || c == 0x7f || c == '/' || c == '\\' || c == ':' ||
+            c == '*' || c == '?' || c == '"' || c == '<' || c == '>' ||
+            c == '|' || c == '\n' || c == '\r' || c == '\t') {
+            out += '_';
+        } else {
+            out += (char)c;
+        }
+    }
+
+    while (!out.empty() && (out.back() == ' ' || out.back() == '.')) {
+        out.pop_back();
+    }
+    if (out.empty()) out = "empty";
+    if (out.size() > 96) out = out.substr(0, 96);
+    return out;
+}
+
+static void write_le16(std::ofstream& out, uint16_t v) {
+    char bytes[2] = {
+        static_cast<char>(v & 0xff),
+        static_cast<char>((v >> 8) & 0xff),
+    };
+    out.write(bytes, sizeof(bytes));
+}
+
+static void write_le32(std::ofstream& out, uint32_t v) {
+    char bytes[4] = {
+        static_cast<char>(v & 0xff),
+        static_cast<char>((v >> 8) & 0xff),
+        static_cast<char>((v >> 16) & 0xff),
+        static_cast<char>((v >> 24) & 0xff),
+    };
+    out.write(bytes, sizeof(bytes));
+}
+
+static bool write_pcm16_wav(const std::filesystem::path& path,
+                            const std::vector<float>& samples,
+                            int sample_rate) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out) return false;
+
+    const uint16_t channels = 1;
+    const uint16_t bits_per_sample = 16;
+    const uint16_t block_align = channels * bits_per_sample / 8;
+    const uint32_t byte_rate = sample_rate * block_align;
+    const uint32_t data_size = static_cast<uint32_t>(samples.size() * block_align);
+    const uint32_t riff_size = 36 + data_size;
+
+    out.write("RIFF", 4);
+    write_le32(out, riff_size);
+    out.write("WAVE", 4);
+    out.write("fmt ", 4);
+    write_le32(out, 16);
+    write_le16(out, 1);
+    write_le16(out, channels);
+    write_le32(out, static_cast<uint32_t>(sample_rate));
+    write_le32(out, byte_rate);
+    write_le16(out, block_align);
+    write_le16(out, bits_per_sample);
+    out.write("data", 4);
+    write_le32(out, data_size);
+
+    for (float sample : samples) {
+        sample = std::max(-1.0f, std::min(1.0f, sample));
+        const int16_t pcm = static_cast<int16_t>(std::lrint(sample * 32767.0f));
+        write_le16(out, static_cast<uint16_t>(pcm));
+    }
+
+    return out.good();
+}
+
+static void save_asr_debug_audio_if_needed(bool enabled,
+                                           const std::filesystem::path& dir,
+                                           int speech_count,
+                                           const std::string& asr_text,
+                                           const std::vector<float>& samples) {
+    if (!enabled || samples.empty()) return;
+
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        fprintf(stderr, "[ASR Debug] Failed to create dir %s: %s\n",
+                dir.string().c_str(), ec.message().c_str());
+        return;
+    }
+
+    char prefix[32];
+    std::snprintf(prefix, sizeof(prefix), "%04d_", speech_count);
+    std::filesystem::path path = dir / (std::string(prefix) +
+        sanitize_debug_filename(asr_text) + "_" + debug_timestamp_for_filename() + ".wav");
+
+    if (write_pcm16_wav(path, samples, SAMPLE_RATE)) {
+        fprintf(stdout, "%s[ASR Debug] Saved ASR audio: %s%s\n",
+                COLOR_CYAN, path.string().c_str(), COLOR_RESET);
+    } else {
+        fprintf(stderr, "[ASR Debug] Failed to save ASR audio: %s\n", path.string().c_str());
+    }
+}
+
+static void save_asr_debug_audio_pair_if_needed(bool enabled,
+                                                const std::filesystem::path& root_dir,
+                                                int speech_count,
+                                                const std::string& asr_text,
+                                                const std::vector<float>& raw_samples,
+                                                const std::vector<float>& asr_samples) {
+    if (!enabled) return;
+    save_asr_debug_audio_if_needed(true, root_dir / "raw_capture",
+                                   speech_count, asr_text, raw_samples);
+    save_asr_debug_audio_if_needed(true, root_dir / "asr_input",
+                                   speech_count, asr_text, asr_samples);
+}
+
 
 // 计算音频数据的 RMS（均方根）能量，衡量音量大小
 static float compute_rms(const float* data, size_t n) {
@@ -990,27 +1136,6 @@ static void execute_action(const Action& action) {
     }
 }
 
-static bool looks_like_asr_prompt_artifact(const std::string& text) {
-    if (text.empty()) return true;
-    if (text == "," || text == "." || text == "?" || text == "!" ||
-        text == "，" || text == "。" || text == "？" || text == "！") return true;
-    if (text == "嗯" || text == "嗯嗯" || text == "啊" || text == "哦") return true;
-    if (text == "咳" || text == "咳咳" || text == "咳咳咳") return true;
-    if (text == "哼" || text == "哼哼") return true;
-    // 精确匹配完整的 prompt 字符串，避免误判正常短指令（如"打开"、"他说"）
-    // initial_prompt 中的完整连续字符串才触发
-    if (text.find("打开关闭保存删除复制粘贴撤回发送") != std::string::npos) return true;
-    // 仅当同时包含多个 prompt 特征字符串时才判定为 artifact
-    if (text.size() > 80 &&
-        (text.find("能不能要不要会不会可以不可以") != std::string::npos ||
-         text.find("今天天气很好请问有什么可以帮助你的") != std::string::npos)) {
-        if (text.find("一二三四") != std::string::npos ||
-            text.find("他说他们说") != std::string::npos) return true;
-    }
-    // 如果只是单个短 prompt 词被识别（如"打开"），不算 artifact
-    return false;
-}
-
 int main(int argc, char ** argv) {
     std::signal(SIGINT, handle_sigint);
 
@@ -1018,13 +1143,16 @@ int main(int argc, char ** argv) {
     whisper_log_set(cb_log_disable, nullptr);
     llama_log_set(cb_log_disable, nullptr);
 
-    std::string whisperModel  = "models/ggml-medium.bin";
+    std::string whisperModel  = "models/ggml-large-v3-turbo.bin";
     std::string vadModelPath  = "models/ggml-silero-v6.2.0.bin";
     std::string llmModelPath  = "models/gemma4-26b-a4b-it-q4_k_m.gguf";
     std::string textInput;
+    bool debugMode = false;
+    std::filesystem::path asrDebugDir = "asr_debug_audio";
 
     bool textMode = false;
     bool argError = false;
+    int positionalModelArg = 0;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--text") {
@@ -1040,16 +1168,45 @@ int main(int argc, char ** argv) {
                 break;
             }
             llmModelPath = argv[++i];
+        } else if (arg == "debug" || arg == "--debug") {
+            debugMode = true;
+        } else if (arg == "--asr-debug-dir") {
+            if (i + 1 >= argc) {
+                argError = true;
+                break;
+            }
+            asrDebugDir = argv[++i];
         } else if (!textMode) {
-            if (i == 1) whisperModel = arg;
-            else if (i == 2) vadModelPath = arg;
-            else if (i == 3) llmModelPath = arg;
+            if (positionalModelArg == 0) whisperModel = arg;
+            else if (positionalModelArg == 1) vadModelPath = arg;
+            else if (positionalModelArg == 2) llmModelPath = arg;
+            positionalModelArg++;
         }
     }
 
     if (argError || (textMode && textInput.empty())) {
-        fprintf(stderr, "Usage: %s --text \"打开计算器\" [--llm path/to/model.gguf]\n", argv[0]);
+        fprintf(stderr,
+                "Usage: %s [debug] [--asr-debug-dir dir] [whisper_model] [vad_model] [llm_model]\n"
+                "       %s --text \"打开计算器\" [--llm path/to/model.gguf]\n",
+                argv[0], argv[0]);
         return 1;
+    }
+
+    if (debugMode) {
+        std::error_code ec;
+        std::filesystem::create_directories(asrDebugDir, ec);
+        std::filesystem::create_directories(asrDebugDir / "raw_capture", ec);
+        std::filesystem::create_directories(asrDebugDir / "asr_input", ec);
+        if (ec) {
+            fprintf(stderr, "Failed to create ASR debug dir %s: %s\n",
+                    asrDebugDir.string().c_str(), ec.message().c_str());
+            return 1;
+        }
+        printf("%s[%s] Debug mode enabled. ASR audio dir: %s%s\n",
+               COLOR_CYAN, current_time_str().c_str(),
+               std::filesystem::absolute(asrDebugDir).string().c_str(), COLOR_RESET);
+        printf("%s[%s] Debug audio stages: raw_capture/ before filtering, asr_input/ sent to Whisper%s\n",
+               COLOR_CYAN, current_time_str().c_str(), COLOR_RESET);
     }
 
     // ============================================================
@@ -1298,12 +1455,6 @@ int main(int argc, char ** argv) {
                    COLOR_RESET);
         }
 
-        // 更新 padding 环形缓冲
-        padBuffer.insert(padBuffer.end(), chunk.begin(), chunk.end());
-        if (padBuffer.size() > (size_t)PAD_FRAMES * SAMPLES_PER_VAD_FRAME) {
-            padBuffer.erase(padBuffer.begin(), padBuffer.begin() + SAMPLES_PER_VAD_FRAME);
-        }
-
         switch (state) {
             case STATE_IDLE: {
                 if (isSpeech) {
@@ -1314,7 +1465,6 @@ int main(int argc, char ** argv) {
 
                     speechBuffer.clear();
                     speechBuffer.insert(speechBuffer.end(), padBuffer.begin(), padBuffer.end());
-                    speechFrames += (int)(padBuffer.size() / SAMPLES_PER_VAD_FRAME);
 
                     speechBuffer.insert(speechBuffer.end(), chunk.begin(), chunk.end());
                     speechFrames++;
@@ -1338,8 +1488,6 @@ int main(int argc, char ** argv) {
 
                 if (silenceFrames >= SILENCE_FRAMES_THRESHOLD) {
                     if (speechFrames >= MIN_SPEECH_FRAMES) {
-                        speechBuffer.insert(speechBuffer.end(),
-                            padBuffer.begin(), padBuffer.end());
                         goto do_transcribe;
                     } else {
                         float durMs = speechFrames * 32.0f;
@@ -1347,6 +1495,7 @@ int main(int argc, char ** argv) {
                         speechBuffer.clear();
                         speechFrames = 0;
                         silenceFrames = 0;
+                        padBuffer.clear();
                         printf("%s↩ [%s] Too short (%.0fms), discarding%s\n",
                                COLOR_YELLOW, current_time_str().c_str(),
                                durMs, COLOR_RESET);
@@ -1362,10 +1511,23 @@ int main(int argc, char ** argv) {
             }
         }
 
+        // 更新语音前置 padding。必须放在状态机之后：
+        // 1. IDLE->SPEECHING 时 padBuffer 只包含当前帧之前的音频，避免开头重复当前帧。
+        // 2. 结束转写时不再把 padBuffer 追加到 speechBuffer，避免尾音重复。
+        padBuffer.insert(padBuffer.end(), chunk.begin(), chunk.end());
+        if (padBuffer.size() > (size_t)PAD_FRAMES * SAMPLES_PER_VAD_FRAME) {
+            padBuffer.erase(padBuffer.begin(), padBuffer.begin() + SAMPLES_PER_VAD_FRAME);
+        }
+
         continue;
 
     do_transcribe:
         {
+            std::vector<float> rawSpeechBuffer;
+            if (debugMode) {
+                rawSpeechBuffer = speechBuffer;
+            }
+
             // 高通滤波
             highpass_filter(speechBuffer, 80.0f, SAMPLE_RATE);
 
@@ -1406,21 +1568,23 @@ int main(int argc, char ** argv) {
             wparams.suppress_nst     = true;
 
             wparams.temperature      = 0.0f;
-            wparams.temperature_inc  = 0.0f;             // 不做高温 fallback，减少噪音段幻听和重试耗时
+            wparams.temperature_inc  = 0.4f;             // 允许低置信短句 fallback，减少重复解码
             wparams.entropy_thold    = 1.2f;
             wparams.logprob_thold    = -1.0f;
-            wparams.no_speech_thold  = 0.4f;
+            wparams.no_speech_thold  = 0.5f;
             wparams.max_len          = 40;
 
-            wparams.beam_search.beam_size = 5;           // 兼顾准确率和短指令延迟
+            wparams.beam_search.beam_size = 7;           // large-v3-turbo 下优先保证短句准确率
 
             const char * chinese_prompt_v2 =
-                "播放周杰伦的歌，播放稻香，播放晴天，暂停音乐，继续播放，下一首，上一首，"
-                "北京天气，上海天气，深圳天气，天津天气，打开计算器，现在几点。";
+                "语音助手常用指令："
+                "播放周杰伦的歌，播放周杰伦歌曲，播放稻香，播放晴天，播放网易云音乐。"
+                "暂停音乐，继续播放，下一首，上一首，打开网易云音乐。"
+                "北京天气怎么样，上海天气怎么样，打开计算器，现在几点了。"
+                "你好，请问有什么可以帮助你的。";
 
             wparams.initial_prompt        = chinese_prompt_v2;
             wparams.carry_initial_prompt  = false;
-            wparams.audio_ctx             = 512;         // 缩短音频上下文，降低短指令识别延迟
             wparams.tdrz_enable           = false;
 
             whisper_vad_reset_state(vctx);
@@ -1444,32 +1608,63 @@ int main(int argc, char ** argv) {
                 printf("%s  ┌─────────────────────────────────────────────┐%s\n",
                        COLOR_BOLD COLOR_GREEN, COLOR_RESET);
                 printf("%s  │ 📝 RESULT: ", COLOR_BOLD COLOR_GREEN);
+                AsrRejectFeatures asr_features;
+                asr_features.no_speech_prob = nSeg > 0
+                    ? whisper_full_get_segment_no_speech_prob(ctx, 0)
+                    : 1.0f;
+                float tokenProbSum = 0.0f;
+                float minTokenProb = 1.0f;
+                int tokenCount = 0;
                 for (int i = 0; i < nSeg; ++i) {
                     const char* text = whisper_full_get_segment_text(ctx, i);
                     if (text && text[0] != '\0') {
                         printf("%s", text);
                         asr_text += text;
                     }
+                    const int nTokens = whisper_full_n_tokens(ctx, i);
+                    for (int j = 0; j < nTokens; ++j) {
+                        const float p = whisper_full_get_token_p(ctx, i, j);
+                        tokenProbSum += p;
+                        minTokenProb = std::min(minTokenProb, p);
+                        tokenCount++;
+                    }
+                }
+                asr_features.n_tokens = tokenCount;
+                asr_features.avg_token_p = tokenCount > 0 ? tokenProbSum / (float)tokenCount : 0.0f;
+                asr_features.min_token_p = tokenCount > 0 ? minTokenProb : 0.0f;
+                if (debugMode) {
+                    fprintf(stdout,
+                            "%s[ASR Debug] no_speech=%.3f avg_token_p=%.3f min_token_p=%.3f tokens=%d%s\n",
+                            COLOR_CYAN,
+                            asr_features.no_speech_prob,
+                            asr_features.avg_token_p,
+                            asr_features.min_token_p,
+                            asr_features.n_tokens,
+                            COLOR_RESET);
                 }
                 printf("%s\n", COLOR_RESET);
                 printf("%s  └─────────────────────────────────────────────┘%s\n",
                        COLOR_BOLD COLOR_GREEN, COLOR_RESET);
                 printf("\n");
 
+                while (!asr_text.empty() && (asr_text.back() == ' ' || asr_text.back() == '\n'))
+                    asr_text.pop_back();
+                while (!asr_text.empty() && (asr_text.front() == ' ' || asr_text.front() == '\n'))
+                    asr_text.erase(0, 1);
+
+                save_asr_debug_audio_pair_if_needed(debugMode, asrDebugDir,
+                                                    speechCount, asr_text,
+                                                    rawSpeechBuffer, speechBuffer);
+
                 // ============================================================
                 // ★ 语义理解：将 ASR 结果送入 LLM 处理
                 // ============================================================
                 if (!asr_text.empty()) {
-                    // 移除首尾空白
-                    while (!asr_text.empty() && (asr_text.back() == ' ' || asr_text.back() == '\n'))
-                        asr_text.pop_back();
-                    while (!asr_text.empty() && (asr_text.front() == ' ' || asr_text.front() == '\n'))
-                        asr_text.erase(0, 1);
-
-                    if (looks_like_asr_prompt_artifact(asr_text)) {
-                        printf("%s⚠ [%s] Ignoring non-command/noisy ASR: \"%s\"%s\n",
-                               COLOR_YELLOW, current_time_str().c_str(),
-                               asr_text.c_str(), COLOR_RESET);
+                    asr_features.text = asr_text;
+                    auto reject_decision = reject_asr_result(asr_features);
+                    if (reject_decision.rejected) {
+                        printf("%s⚠ [%s] 无效命令拒识%s\n",
+                               COLOR_YELLOW, current_time_str().c_str(), COLOR_RESET);
                         goto after_semantic;
                     }
 
@@ -1518,12 +1713,17 @@ int main(int argc, char ** argv) {
             } else {
                 printf("%s❌ [%s] Transcription failed (ret=%d)%s\n",
                        COLOR_RED, current_time_str().c_str(), ret, COLOR_RESET);
+                save_asr_debug_audio_pair_if_needed(debugMode, asrDebugDir,
+                                                    speechCount,
+                                                    "transcription_failed_ret_" + std::to_string(ret),
+                                                    rawSpeechBuffer, speechBuffer);
             }
 
             // 重置 VAD 状态和所有变量
             speechBuffer.clear();
             speechFrames = 0;
             silenceFrames = 0;
+            padBuffer.clear();
             state = STATE_IDLE;
 
             printf("%s──────────────────────────────────────────────────%s\n",

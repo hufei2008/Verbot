@@ -132,8 +132,9 @@ bool build_fast_music_plan(const std::string& asr_text, TaskPlan& plan) {
         action.params = "command=previous;provider=netease_app";
         plan.reply = "已切到上一首。";
     } else if (text == "播放音乐" || text == "放音乐") {
-        action.params = "command=play;provider=netease_app";
-        plan.reply = "开始播放音乐。";
+        plan.reply = "你想听什么歌？";
+        plan.confidence = 0.9f;
+        return true;
     } else if (starts_with(text, "播放") || starts_with(text, "放一下") || starts_with(text, "放一首") ||
                starts_with(text, "我要听") || starts_with(text, "我想听") ||
                starts_with(text, "想听") || starts_with(text, "听一下") ||

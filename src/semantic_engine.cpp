@@ -544,7 +544,12 @@ std::string baidu_api_key() {
                  (line.front() == '\'' && line.back() == '\''))) {
                 line = line.substr(1, line.size() - 2);
             }
-            return trim_copy(line);
+            line = trim_copy(line);
+            if (line == "your_baidu_api_key_here" || line == "<AppBuilder API Key>" ||
+                line == "<API Key>") {
+                continue;
+            }
+            return line;
         }
         return "";
     };
@@ -591,7 +596,8 @@ std::string extract_open_domain_source(const Action& action) {
         return "baidu_news";
     }
     if (q.find("是什么") != std::string::npos || q.find("介绍") != std::string::npos ||
-        q.find("百科") != std::string::npos || q.find("谁是") != std::string::npos) {
+        q.find("百科") != std::string::npos || q.find("谁是") != std::string::npos ||
+        q.find("是谁") != std::string::npos) {
         return "baidu_baike";
     }
     return "baidu_search";
@@ -599,6 +605,20 @@ std::string extract_open_domain_source(const Action& action) {
 
 std::string clean_baike_query(std::string query) {
     query = trim_copy(query);
+    const std::string puncts[] = {"？", "?", "。", ".", "！", "!", "，", ","};
+    bool removed = true;
+    while (removed) {
+        removed = false;
+        query = trim_copy(query);
+        for (const auto& punct : puncts) {
+            if (query.size() >= punct.size() &&
+                query.compare(query.size() - punct.size(), punct.size(), punct) == 0) {
+                query.erase(query.size() - punct.size());
+                removed = true;
+                break;
+            }
+        }
+    }
     const std::string prefixes[] = {"介绍一下", "介绍下", "查一下", "查下", "百度百科", "百科"};
     for (const auto& prefix : prefixes) {
         size_t pos = query.find(prefix);
@@ -713,7 +733,6 @@ std::string baidu_ai_search_answer(const std::string& query,
         "}";
 
     std::vector<std::string> headers = {
-        "Authorization: Bearer " + api_key,
         "X-Appbuilder-Authorization: Bearer " + api_key,
         "Content-Type: application/json"
     };
@@ -807,7 +826,7 @@ bool SemanticEngine::init(const std::string& model_path,
         "用户说\"杭州有哪些好玩的地方\"，输出 {\"reply\":\"我查一下。\",\"steps\":[{\"action\":\"open_domain_qa\",\"target\":\"杭州有哪些好玩的地方\",\"params\":\"source=baidu_search\",\"confidence\":0.9}],\"confidence\":0.9}\n"
         "用户说\"现在几点了\"，输出 {\"reply\":\"我看看时间。\",\"steps\":[{\"action\":\"get_time\",\"target\":\"\",\"params\":\"\",\"confidence\":0.95}],\"confidence\":0.95}\n"
         "用户说\"打开网易云音乐\"，输出 {\"reply\":\"已打开网易云音乐。\",\"steps\":[{\"action\":\"play_music\",\"target\":\"网易云音乐\",\"params\":\"command=open;provider=netease_app\",\"confidence\":0.95}],\"confidence\":0.95}\n"
-        "用户说\"播放音乐\"，输出 {\"reply\":\"好的，播放音乐。\",\"steps\":[{\"action\":\"play_music\",\"target\":\"\",\"params\":\"command=play;provider=netease_app\",\"confidence\":0.9}],\"confidence\":0.9}\n"
+        "用户说\"播放音乐\"，输出 {\"reply\":\"你想听什么歌？\",\"steps\":[],\"confidence\":0.9}\n"
         "用户说\"播放稻香\"，输出 {\"reply\":\"好的，播放稻香。\",\"steps\":[{\"action\":\"play_music\",\"target\":\"稻香\",\"params\":\"command=play;provider=netease_app\",\"confidence\":0.9}],\"confidence\":0.9}\n"
         "用户说\"我要听周杰伦的歌\"，输出 {\"reply\":\"好的，播放周杰伦的歌。\",\"steps\":[{\"action\":\"play_music\",\"target\":\"周杰伦\",\"params\":\"command=artist_play;provider=netease_app\",\"confidence\":0.95}],\"confidence\":0.95}\n"
         "用户说\"暂停音乐\"，输出 {\"reply\":\"已暂停。\",\"steps\":[{\"action\":\"play_music\",\"target\":\"\",\"params\":\"command=pause;provider=netease_app\",\"confidence\":0.95}],\"confidence\":0.95}\n"

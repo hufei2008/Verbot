@@ -74,5 +74,14 @@ int main() {
                     c.input.c_str(), action.target.c_str(), action.params.c_str());
     }
 
+    {
+        TaskPlan plan;
+        require_true(build_fast_music_plan("播放音乐。", plan), "播放音乐 should match music intent");
+        require_true(plan.actions.empty(), "播放音乐 should ask for a target instead of producing an empty play action");
+        require_true(plan.reply == "你想听什么歌？",
+                     std::string("播放音乐 reply expected \"你想听什么歌？\", got \"") + plan.reply + "\"");
+        std::printf("[PASS] %-24s -> ask target\n", "播放音乐。");
+    }
+
     return 0;
 }

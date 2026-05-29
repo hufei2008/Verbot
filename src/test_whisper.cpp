@@ -65,7 +65,7 @@ int main(int argc, char ** argv) {
     whisper_log_set(cb_log_disable, nullptr);
 
     // 默认模型和音频路径
-    std::string modelPath  = "models/ggml-base.bin";
+    std::string modelPath  = "models/ggml-large-v3-turbo.bin";
     std::string audioPath  = "test_speech.wav";
 
     // 支持命令行参数覆盖默认路径

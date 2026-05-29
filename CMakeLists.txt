@@ -49,6 +49,8 @@ add_executable(Verbot
     src/main.cpp
     src/audio_recorder.cpp
     src/audio_recorder.h
+    src/asr_rejector.cpp
+    src/asr_rejector.h
     src/llm_client.cpp
     src/llm_client.h
     src/llm_task.cpp
@@ -133,6 +135,19 @@ target_include_directories(test_music_intent PRIVATE
     ${CMAKE_SOURCE_DIR}/vendor/llama.cpp/ggml/include
     ${TTS_PYTHON_PREFIX}/include/python3.10
     ${TTS_PYTHON_PREFIX}/lib/python3.10/site-packages/numpy/core/include
+)
+
+# ════════════════════════════════════════
+# 4.2 ASR 拒识测试
+# ════════════════════════════════════════
+add_executable(test_asr_rejector
+    src/test_asr_rejector.cpp
+    src/asr_rejector.cpp
+    src/asr_rejector.h
+)
+
+target_include_directories(test_asr_rejector PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
 )
 
 # ════════════════════════════════════════
