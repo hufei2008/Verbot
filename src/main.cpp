@@ -1333,7 +1333,7 @@ int main(int argc, char ** argv) {
 
     // VAD 参数
     struct whisper_vad_params vad_params = whisper_vad_default_params();
-    vad_params.threshold               = 1.0f;   // 最高概率阈值，最大限度减少噪音误触发
+    vad_params.threshold               = 0.5f;   // Silero VAD 官方默认概率阈值；1.0 会导致真实语音几乎无法触发
     vad_params.min_speech_duration_ms  = 300;    // 增加最小语音持续时长
     vad_params.min_silence_duration_ms = 700;    // 增加沉默判定时长
     vad_params.speech_pad_ms           = 200;
@@ -1394,16 +1394,20 @@ int main(int argc, char ** argv) {
     int vadStartCount = 0;
     int speechFrames = 0;
 
-    const int SILENCE_FRAMES_THRESHOLD = 10;
+    const int VAD_FRAME_MS = SAMPLES_PER_VAD_FRAME * 1000 / SAMPLE_RATE;
+    const int SILENCE_FRAMES_THRESHOLD = std::max(
+        1, (vad_params.min_silence_duration_ms + VAD_FRAME_MS - 1) / VAD_FRAME_MS);
     int silenceFrames = 0;
 
-    const int MIN_SPEECH_FRAMES = 12;            // 需要更多连续帧才触发
-    const int MAX_SPEECH_FRAMES = 30 * 1000 / 32;
+    const int MIN_SPEECH_FRAMES = std::max(
+        1, (vad_params.min_speech_duration_ms + VAD_FRAME_MS - 1) / VAD_FRAME_MS);
+    const int MAX_SPEECH_FRAMES = 30 * 1000 / VAD_FRAME_MS;
 
-    const float SPEECH_RMS_THRESHOLD = 0.025f;   // 提高能量门槛，小环境音不触发
-    float noiseFloor = 0.025f;
+    const float SPEECH_RMS_THRESHOLD = 0.006f;   // 辅助能量门槛，避免把正常近场语音挡掉
+    float noiseFloor = 0.003f;
 
-    const int PAD_FRAMES = 8;
+    const int PAD_FRAMES = std::max(
+        0, (vad_params.speech_pad_ms + VAD_FRAME_MS - 1) / VAD_FRAME_MS);
     std::vector<float> padBuffer;
 
     // 先向 VAD 输入静音帧做校准
@@ -1431,25 +1435,43 @@ int main(int argc, char ** argv) {
         float rms = compute_rms(chunk.data(), (int)chunk.size());
         float peak = compute_peak(chunk.data(), (int)chunk.size());
 
-        if (state == STATE_IDLE && rms < noiseFloor) {
-            noiseFloor = 0.999f * noiseFloor + 0.001f * rms;
+        bool vadOk = whisper_vad_detect_speech_no_reset(vctx,
+                chunk.data(), (int)chunk.size());
+        float vadProb = 0.0f;
+        if (vadOk) {
+            const int nVadProbs = whisper_vad_n_probs(vctx);
+            float* vadProbs = whisper_vad_probs(vctx);
+            if (nVadProbs > 0 && vadProbs != nullptr) {
+                vadProb = vadProbs[nVadProbs - 1];
+            }
+        }
+        bool vadSpeech = vadProb >= vad_params.threshold;
+
+        if (state == STATE_IDLE && !vadSpeech) {
+            noiseFloor = 0.995f * noiseFloor + 0.005f * rms;
+            noiseFloor = std::clamp(noiseFloor, 0.001f, 0.030f);
         }
 
-        bool vadSpeech = whisper_vad_detect_speech_no_reset(vctx,
-                chunk.data(), (int)chunk.size());
+        float adaptiveThreshold = std::clamp(noiseFloor * 3.0f, SPEECH_RMS_THRESHOLD, 0.040f);
+        bool energyHasSpeech = (rms >= adaptiveThreshold) || (vadProb >= 0.85f && peak >= 0.012f);
+        float energyFallbackThreshold = std::clamp(noiseFloor * 4.0f, 0.012f, 0.035f);
+        bool energyFallbackSpeech = (rms >= energyFallbackThreshold && peak >= 0.030f);
 
-        float adaptiveThreshold = std::max(noiseFloor * 5.0f, SPEECH_RMS_THRESHOLD);
-        bool energyHasSpeech = (rms >= adaptiveThreshold);
-
-        bool isSpeech = vadSpeech && energyHasSpeech;
+        bool isSpeech = (vadSpeech && energyHasSpeech) || energyFallbackSpeech;
 
         // VAD 调试日志（每 30 帧或说话时打印）
         static int logCounter = 0;
-        if (VAD_DEBUG_LOG && (++logCounter % 30 == 0 || state == STATE_SPEECHING)) {
-            printf("%s[DEBUG] frame: vad=%d rms=%.4f peak=%.4f thr=%.4f noise=%.4f energy=%d isSpeech=%d state=%s silence=%d%s\n",
+        bool shouldLogVadFrame = VAD_DEBUG_LOG ||
+                                 (debugMode && (++logCounter % 15 == 0 ||
+                                                state == STATE_SPEECHING ||
+                                                rms >= 0.010f ||
+                                                peak >= 0.025f));
+        if (shouldLogVadFrame) {
+            printf("%s[ASR Debug] vad_ok=%d vad_prob=%.3f vad_thr=%.3f rms=%.4f peak=%.4f energy_thr=%.4f fallback_thr=%.4f noise=%.4f energy=%d fallback=%d isSpeech=%d state=%s silence=%d%s\n",
                    COLOR_CYAN,
-                   (int)vadSpeech, rms, peak, adaptiveThreshold, noiseFloor,
-                   (int)energyHasSpeech, (int)isSpeech,
+                   (int)vadOk, vadProb, vad_params.threshold, rms, peak,
+                   adaptiveThreshold, energyFallbackThreshold, noiseFloor,
+                   (int)energyHasSpeech, (int)energyFallbackSpeech, (int)isSpeech,
                    (state == STATE_IDLE) ? "IDLE" : "SPEECH",
                    silenceFrames,
                    COLOR_RESET);
@@ -1503,7 +1525,7 @@ int main(int argc, char ** argv) {
                 } else if (speechFrames >= MAX_SPEECH_FRAMES) {
                     printf("%s⏰ [%s] Speech too long (%.0fs), force-transcribing...%s\n",
                            COLOR_YELLOW, current_time_str().c_str(),
-                           speechFrames * 32.0f / 1000.0f, COLOR_RESET);
+                           speechFrames * VAD_FRAME_MS / 1000.0f, COLOR_RESET);
                     whisper_vad_reset_state(vctx);
                     goto do_transcribe;
                 }
